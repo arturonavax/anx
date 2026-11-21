@@ -27,3 +27,4 @@ bin/
 # Herdr: deny all runtime by default, allow only vetted template
 /files/herdr/**
 !/files/herdr/config.toml
+package-lock.json
