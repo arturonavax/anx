@@ -1,0 +1,29 @@
+node_modules/
+yarn.lock
+./~/
+logs/
+downloads/
+lv-settings.lua
+*.secret
+*.local
+.env*
+!.env.example
+# Local AI & MCP runtime state
+.atl/
+.codegraph/
+.engram/
+.claude/
+# Cloudflare local state & caches
+.cloudflare/
+.wrangler/
+# Python byte-code & caches
+__pycache__/
+*.py[cod]
+*$py.class
+# Go build binaries
+bin/
+*.exe
+
+# Herdr: deny all runtime by default, allow only vetted template
+/files/herdr/**
+!/files/herdr/config.toml

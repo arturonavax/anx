@@ -1,0 +1,14 @@
+schema_version: 1
+id: security-audit
+name: "Security Audit Engine (anx-security)"
+category: "security"
+description: "Decoupled multi-tool security compliance auditor and vulnerability scanner"
+version: "1.0.0"
+executable: "anx-security"
+entrypoint: "anx-security"
+language: "bash"
+version_args: ["--version"]
+allow_global_path: true
+fallback_builtin: true
+repo_url: "https://github.com/arturonavax/anx"
+update_strategy: "anx_self"

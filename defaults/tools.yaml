@@ -1,0 +1,26 @@
+# Universal built-in tools shipped with the ANX engine.
+# Additional personal or third-party tools are loaded from configured tool sources,
+# the active configuration repository, or ~/.config/anx/tools.d/*.yaml.
+tools:
+  - id: ai
+    name: "AI Productivity Suite (anx ai)"
+    category: "ai"
+    description: "Multi-harness AI CLI suite, rolling quota tracker, and gitflow automation"
+    executable: "anx"
+    fallback_builtin: true
+    language: "go"
+    version_args: ["ai", "--version"]
+    repo_url: "https://github.com/arturonavax/anx"
+    update_strategy: "anx_self"
+
+  - id: security-audit
+    name: "Security Audit Engine (anx-security)"
+    category: "security"
+    description: "Decoupled multi-tool security compliance auditor and vulnerability scanner"
+    executable: "anx-security"
+    fallback_builtin: true
+    allow_global_path: true
+    language: "bash"
+    version_args: ["--version"]
+    repo_url: "https://github.com/arturonavax/anx"
+    update_strategy: "anx_self"

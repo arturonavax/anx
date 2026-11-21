@@ -1,0 +1,1449 @@
+package tui
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/arturonavax/anx/internal/app"
+	"github.com/arturonavax/anx/internal/catalog"
+	"github.com/arturonavax/anx/internal/testutil"
+	"github.com/arturonavax/anx/internal/domain"
+	"github.com/arturonavax/anx/internal/platform"
+	"github.com/arturonavax/anx/internal/providers"
+	"github.com/arturonavax/anx/internal/security"
+	"github.com/arturonavax/anx/internal/state"
+	"github.com/arturonavax/anx/internal/theme"
+)
+
+func newTestDeps(t *testing.T) Deps {
+	t.Helper()
+	cat := testutil.RichCatalog(t)
+	plat := platform.Detect()
+	pal := theme.ByName("tokyo-night")
+	return Deps{
+		Platform: plat,
+		Catalog:  cat,
+		Theme:    &pal,
+		Styles:   theme.NewStyles(pal),
+	}
+}
+
+func TestNewModelAndDimensions(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+	m.SetDimensions(120, 40)
+
+	if m.ActiveTab() != TabOverview {
+		t.Fatalf("expected initial tab to be TabOverview, got %v", m.ActiveTab())
+	}
+	if len(m.packages) == 0 {
+		t.Fatalf("expected packages to be populated from catalog")
+	}
+
+	view := m.View()
+	content := view.Content
+	if !strings.Contains(content, "ANX") {
+		t.Fatalf("expected view to contain header 'ANX', got: %s", content)
+	}
+	if !strings.Contains(content, "SYSTEM SUMMARY") && !strings.Contains(content, "SYSTEM OVERVIEW") {
+		t.Fatalf("expected view to contain system overview, got: %s", content)
+	}
+}
+
+func TestKeyboardNavigation(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+	m.SetDimensions(120, 40)
+
+	// Test Tab key forward cycle
+	newM, _ := m.Update(tea.KeyPressMsg{Code: '	', Text: "tab"})
+	mod := newM.(Model)
+	if mod.ActiveTab() != TabPackages {
+		t.Fatalf("expected TabPackages after tab, got %v", mod.ActiveTab())
+	}
+
+	// Test direct tab jumping
+	for i, key := range []string{"1", "2", "3", "4", "5", "6", "7", "8"} {
+		nm, _ := mod.Update(tea.KeyPressMsg{Text: key})
+		curr := nm.(Model)
+		if int(curr.ActiveTab()) != i {
+			t.Fatalf("key %s: expected tab %d, got %d", key, i, curr.ActiveTab())
+		}
+	}
+
+	// Test shift+tab backward cycle from TabOverview -> TabSecurity
+	nm, _ := mod.Update(tea.KeyPressMsg{Text: "1"})
+	curr := nm.(Model)
+	nm, _ = curr.Update(tea.KeyPressMsg{Text: "shift+tab"})
+	curr = nm.(Model)
+	if curr.ActiveTab() != TabSecurity {
+		t.Fatalf("expected TabSecurity after shift+tab from TabOverview, got %v", curr.ActiveTab())
+	}
+
+	// Test cursor navigation
+	nm, _ = curr.Update(tea.KeyPressMsg{Text: "2"}) // switch to packages
+	curr = nm.(Model)
+	nm, _ = curr.Update(tea.KeyPressMsg{Text: "j"})
+	curr = nm.(Model)
+	if curr.selectedIdx != 1 {
+		t.Fatalf("expected selectedIdx to be 1 after 'j', got %d", curr.selectedIdx)
+	}
+	nm, _ = curr.Update(tea.KeyPressMsg{Text: "k"})
+	curr = nm.(Model)
+	if curr.selectedIdx != 0 {
+		t.Fatalf("expected selectedIdx to be 0 after 'k', got %d", curr.selectedIdx)
+	}
+
+	// Test accordion toggle
+	nm, _ = curr.Update(tea.KeyPressMsg{Text: "a"})
+	curr = nm.(Model)
+	if curr.accordionMode {
+		t.Fatalf("expected accordion to toggle to false")
+	}
+
+	// Test help modal toggle
+	nm, _ = curr.Update(tea.KeyPressMsg{Text: "?"})
+	curr = nm.(Model)
+	if !curr.showHelp {
+		t.Fatalf("expected showHelp to be true after '?'")
+	}
+	view := curr.View().Content
+	if !strings.Contains(view, "KEYBOARD SHORTCUTS") {
+		t.Fatalf("expected help modal content in view")
+	}
+}
+
+func TestMouseInteraction(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+	m.SetDimensions(120, 40)
+
+	// Click row 1 at X=18 (should hit TabPackages)
+	clickMsg := tea.MouseClickMsg{
+		X:      18,
+		Y:      1,
+		Button: tea.MouseLeft,
+	}
+	nm, _ := m.Update(clickMsg)
+	curr := nm.(Model)
+	if curr.ActiveTab() != TabPackages {
+		t.Fatalf("expected mouse click on tab bar to select TabPackages, got %v", curr.ActiveTab())
+	}
+
+	// Mouse wheel down
+	wheelDown := tea.MouseWheelMsg{
+		X:      20,
+		Y:      10,
+		Button: tea.MouseWheelDown,
+	}
+	nm, _ = curr.Update(wheelDown)
+	curr = nm.(Model)
+	if curr.selectedIdx != 1 {
+		t.Fatalf("expected wheel down to increment selectedIdx, got %d", curr.selectedIdx)
+	}
+
+	// Mouse wheel up
+	wheelUp := tea.MouseWheelMsg{
+		X:      20,
+		Y:      10,
+		Button: tea.MouseWheelUp,
+	}
+	nm, _ = curr.Update(wheelUp)
+	curr = nm.(Model)
+	if curr.selectedIdx != 0 {
+		t.Fatalf("expected wheel up to decrement selectedIdx, got %d", curr.selectedIdx)
+	}
+}
+
+func TestGoldenRulesFormatting(t *testing.T) {
+	// Golden Rule #1 & #2: Truncation and bordered panel line filling
+	pal := theme.ByName("tokyo-night")
+	st := theme.NewStyles(pal)
+
+	lines := []string{"Line 1", "Line 2 - A very long line that would wrap if not truncated with ANSI protection", "Line 3"}
+	panel := BuildPanel(st, lines, 40, 10, true)
+
+	split := strings.Split(panel, "\n")
+	if len(split) != 10 {
+		t.Fatalf("expected exactly 10 lines in rendered panel, got %d", len(split))
+	}
+
+	truncated := AnsiTruncate("This is a very long string that should be trimmed safely", 15)
+	if len(truncated) > 20 { // UTF-8 ellipsis could be 3 bytes
+		t.Fatalf("expected truncated string to be <= 20 bytes, got %d", len(truncated))
+	}
+}
+
+func TestWizardModelWorkflow(t *testing.T) {
+	deps := newTestDeps(t)
+	wiz := NewWizardModel(deps.Platform, deps.Catalog, nil)
+	wiz.width = 100
+	wiz.height = 30
+
+	if wiz.stage != StageSelectProfile {
+		t.Fatalf("expected initial wizard stage StageSelectProfile, got %v", wiz.stage)
+	}
+
+	// Enter selects profile and advances to StageSelectEnvironment
+	nm, _ := wiz.Update(tea.KeyPressMsg{Text: "enter"})
+	w := nm.(WizardModel)
+	if w.stage != StageSelectEnvironment {
+		t.Fatalf("expected StageSelectEnvironment after enter, got %v", w.stage)
+	}
+
+	// Verify environment view rendering
+	envView := w.View()
+	if !strings.Contains(envView.Content, "SHELL SELECTION") || !strings.Contains(envView.Content, "TERMINAL SELECTION") {
+		t.Fatalf("expected shell and terminal selection in envView, got: %s", envView.Content)
+	}
+
+	// Switch focus to terminal and select
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "tab"})
+	w = nm.(WizardModel)
+	if w.envFocus != "terminal" {
+		t.Fatalf("expected envFocus to be terminal after tab, got %s", w.envFocus)
+	}
+
+	// Enter advances to StageSelectPackages
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "enter"})
+	w = nm.(WizardModel)
+	if w.stage != StageSelectPackages {
+		t.Fatalf("expected StageSelectPackages after enter, got %v", w.stage)
+	}
+
+	// Space toggles package
+	nm, _ = w.Update(tea.KeyPressMsg{Text: " "})
+	w = nm.(WizardModel)
+
+	// Enter advances to StagePlanning asynchronously
+	nm, cmd := w.Update(tea.KeyPressMsg{Text: "enter"})
+	w = nm.(WizardModel)
+	if w.stage != StagePlanning {
+		t.Fatalf("expected StagePlanning after enter, got %v", w.stage)
+	}
+	if cmd == nil {
+		t.Fatalf("expected non-nil tea.Cmd for async planning")
+	}
+
+	// Deliver wizardPlanDoneMsg
+	nm, _ = w.Update(wizardPlanDoneMsg{plan: nil, diffs: nil, err: nil})
+	w = nm.(WizardModel)
+	if w.stage != StageReviewPlan {
+		t.Fatalf("expected StageReviewPlan after plan done, got %v", w.stage)
+	}
+
+	// View renders without panic
+	view := w.View()
+	if !strings.Contains(view.Content, "ANX SETUP WIZARD") {
+		t.Fatalf("expected wizard header in view, got: %s", view.Content)
+	}
+}
+
+func TestSecurityAuditTabAndShortcuts(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+	m.SetDimensions(120, 40)
+
+	// Switch to TabSecurity
+	nm, _ := m.Update(tea.KeyPressMsg{Text: "8"})
+	curr := nm.(Model)
+	if curr.ActiveTab() != TabSecurity {
+		t.Fatalf("expected activeTab to be TabSecurity, got %v", curr.ActiveTab())
+	}
+
+	// Deliver simulated systemAuditLoadedMsg
+	fakeReport := &security.SecurityAuditReport{
+		Profile:        security.ProfileWorkstation,
+		HardeningScore: 88,
+		Findings: []security.SecurityFinding{
+			{
+				ID:                 "SEC-TEST-001",
+				Category:           security.CategoryNetwork,
+				Severity:           security.SeverityCritical,
+				Title:              "Unprotected Test Port",
+				Description:        "Port 9999 is open",
+				Remediation:        "Close test port",
+				RemediationCommand: "iptables -D INPUT -p tcp --dport 9999 -j ACCEPT",
+			},
+		},
+	}
+
+	nm, _ = curr.Update(systemAuditLoadedMsg(fakeReport))
+	curr = nm.(Model)
+	if curr.securityReport == nil || len(curr.securityReport.Findings) != 1 {
+		t.Fatalf("expected 1 finding in securityReport")
+	}
+
+	view := curr.View().Content
+	if !strings.Contains(view, "SYSTEM SECURITY AUDIT") {
+		t.Fatalf("expected security audit header in view, got: %s", view)
+	}
+	if !strings.Contains(view, "Unprotected Test Port") {
+		t.Fatalf("expected test finding title in view, got: %s", view)
+	}
+	if !strings.Contains(view, "88/100") {
+		t.Fatalf("expected score 88/100 in view, got: %s", view)
+	}
+
+	// Test profile cycling with 'p'
+	nm, _ = curr.Update(tea.KeyPressMsg{Text: "p"})
+	curr = nm.(Model)
+	if curr.securityProfile != security.ProfileServer {
+		t.Fatalf("expected profile to switch to server, got %s", curr.securityProfile)
+	}
+
+	// Test script generation with 's'
+	nm, _ = curr.Update(tea.KeyPressMsg{Text: "s"})
+	curr = nm.(Model)
+	if !strings.Contains(curr.statusMsg, "script") {
+		t.Fatalf("expected status message mentioning script, got: %s", curr.statusMsg)
+	}
+}
+
+func TestAdjustScrollOffset(t *testing.T) {
+	// 80 items, 10 visible lines
+	// 1. Initial state
+	offset := AdjustScrollOffset(0, 0, 10, 80)
+	if offset != 0 {
+		t.Fatalf("expected offset 0, got %d", offset)
+	}
+
+	// 2. Cursor at line 9 (still in view)
+	offset = AdjustScrollOffset(9, 0, 10, 80)
+	if offset != 0 {
+		t.Fatalf("expected offset 0 at cursor 9, got %d", offset)
+	}
+
+	// 3. Cursor moves to line 10 -> offset slides to 1
+	offset = AdjustScrollOffset(10, 0, 10, 80)
+	if offset != 1 {
+		t.Fatalf("expected offset 1 at cursor 10, got %d", offset)
+	}
+
+	// 4. Cursor moves back up to 9 while offset is 1 -> offset stays 1 (no erratic jump)
+	offset = AdjustScrollOffset(9, 1, 10, 80)
+	if offset != 1 {
+		t.Fatalf("expected offset 1 at cursor 9, got %d", offset)
+	}
+
+	// 5. Cursor moves up to 0 while offset is 1 -> offset slides to 0
+	offset = AdjustScrollOffset(0, 1, 10, 80)
+	if offset != 0 {
+		t.Fatalf("expected offset 0 at cursor 0, got %d", offset)
+	}
+
+	// 6. Fewer items than visible lines
+	offset = AdjustScrollOffset(2, 5, 10, 5)
+	if offset != 0 {
+		t.Fatalf("expected offset 0 when totalItems < visibleLines, got %d", offset)
+	}
+}
+
+func TestBuildScrollablePanel(t *testing.T) {
+	pal := theme.ByName("tokyo-night")
+	st := theme.NewStyles(pal)
+
+	header := []string{"TEST HEADER"}
+	items := make([]string, 50)
+	for i := 0; i < 50; i++ {
+		items[i] = strings.Repeat("item ", 5)
+	}
+
+	// height 12 -> innerHeight 10 -> availItemLines 9
+	panel := BuildScrollablePanel(st, header, items, 15, 0, 60, 12, true)
+	lines := strings.Split(panel, "\n")
+	if len(lines) != 12 {
+		t.Fatalf("expected exactly 12 lines, got %d", len(lines))
+	}
+	if !strings.Contains(panel, "TEST HEADER") {
+		t.Fatalf("expected panel to contain header")
+	}
+}
+
+func TestWizardScrollAndAsyncApply(t *testing.T) {
+	deps := newTestDeps(t)
+	// Populate a synthetic 20-package catalog to exercise viewport scrolling without requiring an external env checkout
+	manDir := t.TempDir()
+	var sb strings.Builder
+	sb.WriteString("packages:\n")
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&sb, "  - id: pkg-%02d\n    name: Package %02d\n    category: cli-tools\n    strategies:\n      - type: native\n        packages:\n          apt: [pkg-%02d]\n", i, i, i)
+	}
+	_ = os.WriteFile(filepath.Join(manDir, "pkgs.yaml"), []byte(sb.String()), 0o644)
+	if cat, err := catalog.NewRegistryWithOverlays(manDir, ""); err == nil {
+		deps.Catalog = cat
+	}
+	wiz := NewWizardModel(deps.Platform, deps.Catalog, nil)
+	wiz.width = 100
+	wiz.height = 20 // small height to enforce scrolling
+
+	// Stage 1 -> Stage 2
+	nm, _ := wiz.Update(tea.KeyPressMsg{Text: "enter"})
+	w := nm.(WizardModel)
+
+	// Stage 2 -> Stage 3 (Packages)
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "enter"})
+	w = nm.(WizardModel)
+	if w.stage != StageSelectPackages {
+		t.Fatalf("expected StageSelectPackages, got %v", w.stage)
+	}
+
+	// Scroll down in packages
+	for i := 0; i < 15; i++ {
+		nm, _ = w.Update(tea.KeyPressMsg{Text: "j"})
+		w = nm.(WizardModel)
+	}
+	if w.pkgCursor != 15 {
+		t.Fatalf("expected pkgCursor 15, got %d", w.pkgCursor)
+	}
+	if w.pkgScrollOffset == 0 {
+		t.Fatalf("expected pkgScrollOffset > 0 after scrolling down 15 items in 20-row terminal")
+	}
+
+	// View packages
+	pkgView := w.View().Content
+	if !strings.Contains(pkgView, "STAGE 3/5") {
+		t.Fatalf("expected stage 3 view")
+	}
+
+	// Advance to Review Plan via StagePlanning
+	nm, cmdPlan := w.Update(tea.KeyPressMsg{Text: "enter"})
+	w = nm.(WizardModel)
+	if w.stage != StagePlanning {
+		t.Fatalf("expected StagePlanning after enter on StageSelectPackages, got %v", w.stage)
+	}
+	if cmdPlan == nil {
+		t.Fatalf("expected non-nil tea.Cmd for async planning")
+	}
+
+	// Deliver wizardPlanDoneMsg
+	nm, _ = w.Update(wizardPlanDoneMsg{plan: nil, diffs: nil, err: nil})
+	w = nm.(WizardModel)
+	if w.stage != StageReviewPlan {
+		t.Fatalf("expected StageReviewPlan, got %v", w.stage)
+	}
+
+	// Scroll plan down with j
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "j"})
+	w = nm.(WizardModel)
+	if w.planScrollOffset != 1 {
+		t.Fatalf("expected planScrollOffset 1, got %d", w.planScrollOffset)
+	}
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "k"})
+	w = nm.(WizardModel)
+	if w.planScrollOffset != 0 {
+		t.Fatalf("expected planScrollOffset 0 after k, got %d", w.planScrollOffset)
+	}
+
+	// Press Enter to apply -> MUST transition to StageApplying immediately and return tea.Cmd (non-blocking!)
+	nm, cmd := w.Update(tea.KeyPressMsg{Text: "enter"})
+	w = nm.(WizardModel)
+	if w.stage != StageApplying {
+		t.Fatalf("expected StageApplying after enter on StageReviewPlan, got %v", w.stage)
+	}
+	if cmd == nil {
+		t.Fatalf("expected non-nil tea.Cmd for async execution")
+	}
+
+	// Check applying view has STAGE 5/5
+	applyingView := w.View().Content
+	if !strings.Contains(applyingView, "STAGE 5/5") {
+		t.Fatalf("expected STAGE 5/5 in applying view message, got: %s", applyingView)
+	}
+
+	// Deliver progress message
+	nm, _ = w.Update(wizardProgressMsg{
+		StepID:      3,
+		TotalSteps:  10,
+		Phase:       "Purging (Destroyer)",
+		Action:      "purge",
+		ResourceID:  "nvim",
+		Description: "Purging ~/.config/nvim",
+		Percent:     30,
+	})
+	w = nm.(WizardModel)
+	if w.progressPercent != 30 {
+		t.Fatalf("expected progressPercent 30, got %d", w.progressPercent)
+	}
+	progView := w.View().Content
+	if !strings.Contains(progView, "30%") || !strings.Contains(progView, "Purging (Destroyer)") {
+		t.Fatalf("expected progress and phase in applying view, got: %s", progView)
+	}
+
+	// Deliver completion message
+	nm, _ = w.Update(wizardApplyDoneMsg{err: nil})
+	w = nm.(WizardModel)
+	if w.stage != StageCompleted {
+		t.Fatalf("expected StageCompleted after wizardApplyDoneMsg, got %v", w.stage)
+	}
+	completedView := w.View().Content
+	if !strings.Contains(completedView, "SUCCESSFULLY") {
+		t.Fatalf("expected success message in completedView, got: %s", completedView)
+	}
+}
+
+func TestWizardEscBackwardNavigation(t *testing.T) {
+	deps := newTestDeps(t)
+	wiz := NewWizardModel(deps.Platform, deps.Catalog, nil)
+
+	// Stage 1 (Profile) -> Stage 2 (Environment)
+	nm, _ := wiz.Update(tea.KeyPressMsg{Text: "enter"})
+	w := nm.(WizardModel)
+	if w.stage != StageSelectEnvironment {
+		t.Fatalf("expected StageSelectEnvironment, got %v", w.stage)
+	}
+
+	// Stage 2 (Environment) -> Stage 3 (Packages)
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "enter"})
+	w = nm.(WizardModel)
+	if w.stage != StageSelectPackages {
+		t.Fatalf("expected StageSelectPackages, got %v", w.stage)
+	}
+
+	// Stage 3 (Packages) -> StagePlanning
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "enter"})
+	w = nm.(WizardModel)
+	if w.stage != StagePlanning {
+		t.Fatalf("expected StagePlanning, got %v", w.stage)
+	}
+
+	// Esc in StagePlanning -> returns to StageSelectPackages
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "esc"})
+	w = nm.(WizardModel)
+	if w.stage != StageSelectPackages {
+		t.Fatalf("expected StageSelectPackages after esc on StagePlanning, got %v", w.stage)
+	}
+
+	// Esc in StageSelectPackages -> returns to StageSelectEnvironment
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "esc"})
+	w = nm.(WizardModel)
+	if w.stage != StageSelectEnvironment {
+		t.Fatalf("expected StageSelectEnvironment after esc on StageSelectPackages, got %v", w.stage)
+	}
+
+	// Esc in StageSelectEnvironment -> returns to StageSelectProfile
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "esc"})
+	w = nm.(WizardModel)
+	if w.stage != StageSelectProfile {
+		t.Fatalf("expected StageSelectProfile after esc on StageSelectEnvironment, got %v", w.stage)
+	}
+
+	// Esc in StageSelectProfile -> quits
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "esc"})
+	w = nm.(WizardModel)
+	if !w.quitting {
+		t.Fatalf("expected quitting to be true after esc on StageSelectProfile")
+	}
+}
+
+func TestWizardPackageDependenciesAutoSelection(t *testing.T) {
+	cat := testutil.RichCatalog(t)
+	plat := platform.Detect()
+	w := NewWizardModel(plat, cat, nil)
+
+	// Inject a custom package hierarchy to verify auto-selection and auto-deselection
+	toolA := domain.ManagedResource{ID: "tool-a", DependsOn: []string{"dep-b"}}
+	depB := domain.ManagedResource{ID: "dep-b", DependsOn: []string{"dep-c"}}
+	depC := domain.ManagedResource{ID: "dep-c"}
+
+	w.packages = []domain.ManagedResource{toolA, depB, depC}
+	w.pkgMap = map[string]domain.ManagedResource{
+		"tool-a": toolA,
+		"dep-b":  depB,
+		"dep-c":  depC,
+	}
+	w.requiredBy = map[string][]string{
+		"dep-b": {"tool-a"},
+		"dep-c": {"dep-b"},
+	}
+	w.selectedPkgs = map[string]bool{
+		"tool-a": false,
+		"dep-b":  false,
+		"dep-c":  false,
+	}
+	w.stage = StageSelectPackages
+	w.pkgCursor = 0 // On tool-a
+
+	// Press space to enable tool-a -> should transitively select dep-b and dep-c
+	nm, _ := w.Update(tea.KeyPressMsg{Code: ' ', Text: " "})
+	w = nm.(WizardModel)
+	if !w.selectedPkgs["tool-a"] || !w.selectedPkgs["dep-b"] || !w.selectedPkgs["dep-c"] {
+		t.Fatalf("expected tool-a, dep-b, and dep-c to all be marked true, got: %+v", w.selectedPkgs)
+	}
+
+	// Move cursor to dep-c (index 2) and press space to disable dep-c
+	w.pkgCursor = 2
+	nm, _ = w.Update(tea.KeyPressMsg{Code: ' ', Text: " "})
+	w = nm.(WizardModel)
+	if w.selectedPkgs["dep-c"] {
+		t.Fatalf("expected dep-c to be false")
+	}
+	// Because dep-c was unmarked, dep-b (depends on c) and tool-a (depends on b) must both be unmarked!
+	if w.selectedPkgs["dep-b"] || w.selectedPkgs["tool-a"] {
+		t.Fatalf("expected dep-b and tool-a to be auto-unmarked when dep-c is unmarked, got: %+v", w.selectedPkgs)
+	}
+}
+
+func TestWizardProfilePersistence(t *testing.T) {
+	tempDir := t.TempDir()
+	store, err := state.OpenStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	cat := testutil.RichCatalog(t)
+	plat := platform.Detect()
+	w := NewWizardModel(plat, cat, nil, WithWizardStore(store))
+
+	// Find index of "full" profile if available, or first profile
+	fullIdx := 0
+	for i, p := range w.profiles {
+		if p.Name == "full" {
+			fullIdx = i
+			break
+		}
+	}
+	w.selectedProf = fullIdx
+	targetProfile := w.profiles[fullIdx].Name
+
+	// Deliver successful apply done message
+	nm, _ := w.Update(wizardApplyDoneMsg{err: nil})
+	w = nm.(WizardModel)
+
+	if !w.IsCompleted() {
+		t.Fatalf("expected wizard to be completed")
+	}
+	if w.ChosenProfile() != targetProfile {
+		t.Fatalf("expected chosen profile %q, got %q", targetProfile, w.ChosenProfile())
+	}
+	if store.ActiveProfile() != targetProfile {
+		t.Fatalf("expected persisted active profile to be %q, got %q", targetProfile, store.ActiveProfile())
+	}
+}
+
+func TestConfigsIntegrationStatus(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+	m.SetDimensions(120, 40)
+
+	// Jump to TabConfigs (tab 3)
+	nm, _ := m.Update(tea.KeyPressMsg{Text: "3"})
+	m = nm.(Model)
+	if m.ActiveTab() != TabConfigs {
+		t.Fatalf("expected TabConfigs, got %v", m.ActiveTab())
+	}
+
+	view := m.View()
+	content := view.Content
+	if !strings.Contains(content, "[Integrated ✓]") && !strings.Contains(content, "[Not Integrated ✗]") {
+		t.Fatalf("expected configs tab to display integration badges, got:\n%s", content)
+	}
+}
+
+func TestRenderSelectedRowContrast(t *testing.T) {
+	pal := theme.ByName("tokyo-night")
+	st := theme.NewStyles(pal)
+
+	// An input with nested ANSI color codes and resets
+	nestedInput := "\x1b[32m[✓]\x1b[0m \x1b[1;36mripgrep\x1b[0m : Fast search"
+	rendered := st.RenderSelectedRow(nestedInput)
+
+	// Rendered text must not contain inner ANSI color codes leaking before reset
+	if strings.Contains(rendered, "\x1b[32m") || strings.Contains(rendered, "\x1b[1;36m") {
+		t.Fatalf("expected inner ANSI color codes to be stripped in RenderSelectedRow, got: %q", rendered)
+	}
+}
+
+func TestDashboardPackagesPinCoreAnxAndSorting(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+
+	if len(m.tools) == 0 {
+		t.Fatalf("expected registered tools, got 0")
+	}
+	if m.tools[0].ID != "anx" {
+		t.Fatalf("expected anx to be pinned at index 0 of tools, got %s", m.tools[0].ID)
+	}
+	if len(m.packages) == 0 || m.packages[0].ID != "anx" {
+		t.Fatalf("expected anx to be pinned at index 0 of packages, got %s", m.packages[0].ID)
+	}
+
+	// Verify categories are sorted in tools
+	for i := 1; i < len(m.tools)-1; i++ {
+		curr := m.tools[i]
+		next := m.tools[i+1]
+		if curr.Category > next.Category {
+			t.Errorf("tools not sorted by category: %s (%s) > %s (%s)", curr.ID, curr.Category, next.ID, next.Category)
+		}
+	}
+}
+
+func TestDashboardMouseClickPreservesScrollOffset(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+	m.SetDimensions(120, 40)
+
+	// Switch to TabPackages
+	nm, _ := m.Update(tea.KeyPressMsg{Text: "2"})
+	m = nm.(Model)
+
+	// Simulate scrolling down
+	m.scrollOffset = 10
+	m.toolsScrollOffset = 10
+
+	// Click row 6 (contentStartY = 4: Header=0, Tabs=1, Border=2, InnerHeader=3 -> relY = 6 - 4 = 2)
+	clickMsg := tea.MouseClickMsg{
+		X:      10,
+		Y:      6,
+		Button: tea.MouseLeft,
+	}
+	nm, _ = m.Update(clickMsg)
+	curr := nm.(Model)
+
+	expectedIdx := 10 + (6 - 4) // scrollOffset (10) + relY (2) = 12
+	if curr.selectedIdx != expectedIdx {
+		t.Fatalf("expected clicked row to select targetIdx %d with scrollOffset, got %d", expectedIdx, curr.selectedIdx)
+	}
+}
+
+func TestDashboardVimHalfPageNavigation(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+	m.SetDimensions(120, 40)
+
+	// Switch to TabPackages
+	nm, _ := m.Update(tea.KeyPressMsg{Text: "2"})
+	m = nm.(Model)
+
+	visible := m.visibleItemLines()
+	halfPage := max(1, visible/2)
+
+	// ctrl+d down
+	nm, _ = m.Update(tea.KeyPressMsg{Text: "ctrl+d"})
+	m = nm.(Model)
+	if m.selectedIdx != halfPage {
+		t.Fatalf("expected ctrl+d to advance cursor by %d, got %d", halfPage, m.selectedIdx)
+	}
+
+	// ctrl+u back up
+	nm, _ = m.Update(tea.KeyPressMsg{Text: "ctrl+u"})
+	m = nm.(Model)
+	if m.selectedIdx != 0 {
+		t.Fatalf("expected ctrl+u to return cursor to 0, got %d", m.selectedIdx)
+	}
+}
+
+func TestDashboardPackageInPlaceUnfoldingAndPreview(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+	m.SetDimensions(120, 40)
+
+	// Switch to TabPackages
+	nm, _ := m.Update(tea.KeyPressMsg{Text: "2"})
+	m = nm.(Model)
+
+	// 1. Check quick preview badge in list without pressing Enter
+	initialView := m.View().Content
+	if !strings.Contains(initialView, "deps)") && !strings.Contains(initialView, "dep)") {
+		t.Fatalf("expected quick preview dependency badge in list, got:\n%s", initialView)
+	}
+
+	// 2. Press Enter to unfold in-place (without leaving packages view)
+	nm, _ = m.Update(tea.KeyPressMsg{Text: "enter"})
+	m = nm.(Model)
+	if m.expandedPkgID == "" {
+		t.Fatalf("expected expandedPkgID to be set on enter")
+	}
+
+	expandedView := m.View().Content
+	if !strings.Contains(expandedView, "├─ Dependencies:") {
+		t.Fatalf("expected in-place unfolded dependencies in view, got:\n%s", expandedView)
+	}
+	if !strings.Contains(expandedView, "├─ Required by:") {
+		t.Fatalf("expected in-place unfolded required by in view")
+	}
+	if !strings.Contains(expandedView, "TOOLS (") || !strings.Contains(expandedView, "DEPENDENCIES (") {
+		t.Fatalf("expected dual-pane list headers to remain visible during in-place unfolding")
+	}
+
+	// 3. Press Enter again to toggle collapse
+	nm, _ = m.Update(tea.KeyPressMsg{Text: "enter"})
+	m = nm.(Model)
+	if m.expandedPkgID != "" {
+		t.Fatalf("expected expandedPkgID to be empty after second enter")
+	}
+
+	// 4. Press Enter then Esc to collapse
+	nm, _ = m.Update(tea.KeyPressMsg{Text: "enter"})
+	m = nm.(Model)
+	nm, _ = m.Update(tea.KeyPressMsg{Text: "esc"})
+	m = nm.(Model)
+	if m.expandedPkgID != "" {
+		t.Fatalf("expected expandedPkgID to be empty after esc")
+	}
+}
+
+func TestDashboardOverviewUpdateCheck(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+	m.SetDimensions(120, 40)
+
+	// Inject background update check result with updates
+	updateMsg := updateCheckLoadedMsg{
+		result: UpdateCheckResult{
+			RepoBehind:   3,
+			ConfigDrifts: 2,
+			HasUpdates:   true,
+			RepoClean:    true,
+		},
+	}
+	nm, _ := m.Update(updateMsg)
+	m = nm.(Model)
+
+	view := m.View().Content
+	if !strings.Contains(view, "3 commit(s)") {
+		t.Fatalf("expected commits behind in overview view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "2 configuratio") {
+		t.Fatalf("expected config drifts in overview view, got:\n%s", view)
+	}
+}
+
+func TestWizardSudoAuthenticationFlow(t *testing.T) {
+	home := t.TempDir()
+	plat := platform.NewTestInfo(platform.TestInfoParams{
+		OS:              "linux",
+		HasSudo:         true,
+		IsRoot:          false,
+		PackageManagers: []string{"apt"},
+		HomeDir:         home,
+		StateDir:        filepath.Join(home, "state"),
+	})
+	cat := testutil.RichCatalog(t)
+	installSvc := app.NewInstallService(app.InstallDeps{Platform: plat, Catalog: cat})
+
+	sudoAuthenticated := false
+	wiz := NewWizardModel(
+		plat,
+		cat,
+		installSvc,
+		WithWizardSudoChecker(func() bool { return sudoAuthenticated }),
+		WithWizardSudoAuthCmd(func() *exec.Cmd { return exec.Command("true") }),
+	)
+
+	// Step through to StageReviewPlan
+	nm, _ := wiz.Update(tea.KeyPressMsg{Text: "enter"}) // profile -> env
+	nm, _ = nm.Update(tea.KeyPressMsg{Text: "enter"})   // env -> packages
+	nm, _ = nm.Update(tea.KeyPressMsg{Text: "enter"})   // packages -> planning
+	w := nm.(WizardModel)
+
+	planWithGit := &domain.ExecutionPlan{
+		Steps: []domain.PlanStep{
+			{ID: 1, ResourceID: "git", Action: domain.ActionInstall},
+		},
+	}
+	nm, _ = w.Update(wizardPlanDoneMsg{plan: planWithGit, diffs: nil, err: nil})
+	w = nm.(WizardModel)
+	if w.stage != StageReviewPlan {
+		t.Fatalf("expected StageReviewPlan, got %v", w.stage)
+	}
+
+	// 1. Unauthenticated: Press Enter to apply -> MUST stay in StageReviewPlan and return ExecProcess Cmd
+	nm, cmd := w.Update(tea.KeyPressMsg{Text: "enter"})
+	w = nm.(WizardModel)
+	if w.stage != StageReviewPlan {
+		t.Fatalf("expected to remain on StageReviewPlan while authenticating sudo, got %v", w.stage)
+	}
+	if cmd == nil {
+		t.Fatalf("expected non-nil tea.Cmd for sudo authentication")
+	}
+
+	// 2. Auth failed (wrong password) -> MUST record sudoErr and stay on StageReviewPlan
+	nm, _ = w.Update(wizardSudoAuthMsg{err: errors.New("incorrect password")})
+	w = nm.(WizardModel)
+	w.width = 120
+	w.height = 50
+	if w.stage != StageReviewPlan {
+		t.Fatalf("expected StageReviewPlan after auth failure, got %v", w.stage)
+	}
+	if w.sudoErr == nil {
+		t.Fatalf("expected non-nil sudoErr after auth failure")
+	}
+	view := w.View().Content
+	if !strings.Contains(view, "Sudo authentication failed") {
+		t.Fatalf("expected failure alert in view, got: %s", view)
+	}
+
+	// 3. Auth succeeded -> MUST clear sudoErr and transition to StageApplying
+	nm, cmdApply := w.Update(wizardSudoAuthMsg{err: nil})
+	w = nm.(WizardModel)
+	if w.stage != StageApplying {
+		t.Fatalf("expected StageApplying after successful auth, got %v", w.stage)
+	}
+	if w.sudoErr != nil {
+		t.Fatalf("expected nil sudoErr after successful auth, got %v", w.sudoErr)
+	}
+	if cmdApply == nil {
+		t.Fatalf("expected non-nil tea.Cmd to kick off apply worker")
+	}
+
+	// 4. Pre-authenticated flow: when sudoAuthenticated is true, Enter proceeds directly
+	sudoAuthenticated = true
+	installSvcPreAuth := app.NewInstallService(app.InstallDeps{Platform: plat, Catalog: cat})
+	wizPreAuth := NewWizardModel(
+		plat,
+		cat,
+		installSvcPreAuth,
+		WithWizardSudoChecker(func() bool { return sudoAuthenticated }),
+	)
+	nm, _ = wizPreAuth.Update(tea.KeyPressMsg{Text: "enter"})
+	nm, _ = nm.Update(tea.KeyPressMsg{Text: "enter"})
+	nm, _ = nm.Update(tea.KeyPressMsg{Text: "enter"})
+	wPre := nm.(WizardModel)
+	planWithGit2 := &domain.ExecutionPlan{
+		Steps: []domain.PlanStep{
+			{ID: 1, ResourceID: "git", Action: domain.ActionInstall},
+		},
+	}
+	nm, _ = wPre.Update(wizardPlanDoneMsg{plan: planWithGit2, diffs: nil, err: nil})
+	wPre = nm.(WizardModel)
+
+	nm, cmdDirect := wPre.Update(tea.KeyPressMsg{Text: "enter"})
+	wPre = nm.(WizardModel)
+	if wPre.stage != StageApplying {
+		t.Fatalf("expected StageApplying directly when pre-authenticated, got %v", wPre.stage)
+	}
+	if cmdDirect == nil {
+		t.Fatalf("expected non-nil tea.Cmd for direct apply")
+	}
+
+	// 5. Darwin with includeOSConfig=true requires sudo (macos-osconfig), toggling [o] off drops that requirement.
+	platDarwin := platform.NewTestInfo(platform.TestInfoParams{
+		OS:              "darwin",
+		Arch:            "arm64",
+		HasSudo:         true,
+		IsRoot:          false,
+		PackageManagers: []string{"brew"},
+	})
+	installSvcDarwin := app.NewInstallService(app.InstallDeps{Platform: platDarwin, Catalog: cat})
+	wizDarwin := NewWizardModel(
+		platDarwin,
+		cat,
+		installSvcDarwin,
+		WithWizardSudoChecker(func() bool { return false }),
+	)
+	nm, _ = wizDarwin.Update(tea.KeyPressMsg{Text: "enter"})
+	nm, _ = nm.Update(tea.KeyPressMsg{Text: "enter"})
+	nm, _ = nm.Update(tea.KeyPressMsg{Text: "enter"})
+	nm, _ = nm.Update(wizardPlanDoneMsg{plan: &domain.ExecutionPlan{}, diffs: nil, err: nil})
+	wDarwin := nm.(WizardModel)
+	if !wDarwin.needsSudo() {
+		t.Fatalf("expected darwin wizard with includeOSConfig=true to require sudo")
+	}
+	nm, cmdSudoDarwin := wDarwin.Update(tea.KeyPressMsg{Text: "enter"})
+	wDarwin = nm.(WizardModel)
+	if wDarwin.stage != StageReviewPlan || cmdSudoDarwin == nil {
+		t.Fatalf("expected darwin wizard to prompt sudo before applying osconfig, got stage=%v cmd=%v", wDarwin.stage, cmdSudoDarwin)
+	}
+	nm, _ = wDarwin.Update(tea.KeyPressMsg{Text: "o"})
+	wDarwinNoOS := nm.(WizardModel)
+	if wDarwinNoOS.needsSudo() {
+		t.Fatalf("expected darwin wizard with includeOSConfig=false and empty plan not to require sudo")
+	}
+}
+
+func TestWizardApplyingMultiProgressConcurrentWorkers(t *testing.T) {
+	cat := testutil.RichCatalog(t)
+	plat := platform.Detect()
+	wiz := NewWizardModel(plat, cat, nil)
+	wiz.stage = StageApplying
+	wiz.progressTotal = 10
+	wiz.progressPercent = 30
+
+	// 1. Dispatch 3 concurrent tasks
+	nm, _ := wiz.Update(wizardProgressMsg{
+		StepID:      1,
+		TotalSteps:  10,
+		Phase:       "Installing",
+		Action:      "install",
+		ResourceID:  "git",
+		Description: "Fast distributed version control",
+		Status:      domain.StepRunning,
+		Percent:     35,
+	})
+	nm, _ = nm.Update(wizardProgressMsg{
+		StepID:      2,
+		TotalSteps:  10,
+		Phase:       "Installing",
+		Action:      "download",
+		ResourceID:  "ghostty",
+		Description: "Ghostty GPU terminal",
+		Status:      domain.StepRunning,
+		Percent:     35,
+	})
+	nm, _ = nm.Update(wizardProgressMsg{
+		StepID:      3,
+		TotalSteps:  10,
+		Phase:       "Installing",
+		Action:      "install",
+		ResourceID:  "herdr",
+		Description: "Herdr terminal multiplexer",
+		Status:      domain.StepRunning,
+		Percent:     35,
+	})
+
+	w := nm.(WizardModel)
+	if len(w.activeWorkers) != 3 {
+		t.Fatalf("expected 3 active workers, got %d", len(w.activeWorkers))
+	}
+
+	rendered := w.renderApplying(100)
+	if !strings.Contains(rendered, "CONCURRENT WORKERS (3 executing in parallel)") {
+		t.Errorf("expected concurrent workers section header, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "git") || !strings.Contains(rendered, "ghostty") || !strings.Contains(rendered, "herdr") {
+		t.Errorf("expected all 3 workers in rendered output, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "[DOWNLOAD]") || !strings.Contains(rendered, "[INSTALL]") {
+		t.Errorf("expected action badges in rendered output, got:\n%s", rendered)
+	}
+
+	// 2. Complete step 1 (git)
+	nm, _ = w.Update(wizardProgressMsg{
+		StepID:      1,
+		TotalSteps:  10,
+		Phase:       "Installing",
+		Action:      "install",
+		ResourceID:  "git",
+		Description: "Fast distributed version control",
+		Status:      domain.StepSuccess,
+		Percent:     45,
+	})
+	w = nm.(WizardModel)
+
+	if len(w.activeWorkers) != 2 {
+		t.Fatalf("expected 2 active workers after step 1 finished, got %d", len(w.activeWorkers))
+	}
+	if w.completedSteps != 1 {
+		t.Fatalf("expected 1 completed step, got %d", w.completedSteps)
+	}
+
+	renderedAfter := w.renderApplying(100)
+	if !strings.Contains(renderedAfter, "CONCURRENT WORKERS (2 executing in parallel)") {
+		t.Errorf("expected 2 concurrent workers header, got:\n%s", renderedAfter)
+	}
+	if !strings.Contains(renderedAfter, "RECENTLY COMPLETED:") {
+		t.Errorf("expected recently completed section, got:\n%s", renderedAfter)
+	}
+	if !strings.Contains(renderedAfter, "✔ git") {
+		t.Errorf("expected git with success badge in recently completed, got:\n%s", renderedAfter)
+	}
+}
+
+func TestWizardPackageOrderingToolsBeforeDeps(t *testing.T) {
+	deps := newTestDeps(t)
+	wiz := NewWizardModel(deps.Platform, deps.Catalog, nil)
+
+	seenDep := false
+	for _, p := range wiz.packages {
+		isDirect := p.IsDirectTool(wiz.requiredBy)
+		if !isDirect {
+			seenDep = true
+		} else if seenDep {
+			t.Fatalf("package %s is a direct tool but was ordered after dependencies!", p.ID)
+		}
+	}
+}
+
+func TestWizardProgressOutputWidgetsAndErrorSummary(t *testing.T) {
+	deps := newTestDeps(t)
+	wiz := NewWizardModel(deps.Platform, deps.Catalog, nil)
+	wiz.stage = StageApplying
+
+	// Send progress with output line
+	nm, _ := wiz.Update(wizardProgressMsg{
+		StepID:      1,
+		TotalSteps:  5,
+		Phase:       "Installing",
+		Action:      "install",
+		ResourceID:  "lazygit",
+		Description: "Simple terminal UI for Git",
+		Status:      domain.StepRunning,
+		Percent:     20,
+		OutputLine:  "Resolved lazygit release asset: lazygit_0.66.2_linux_x86_64.tar.gz",
+	})
+	w := nm.(WizardModel)
+
+	if len(w.workerLogs[1]) != 1 {
+		t.Fatalf("expected 1 log line for worker 1, got %d", len(w.workerLogs[1]))
+	}
+	if len(w.recentOutputLines) != 1 {
+		t.Fatalf("expected 1 recent output line, got %d", len(w.recentOutputLines))
+	}
+
+	rendered := w.renderApplying(100)
+	if !strings.Contains(rendered, "GLOBAL PROGRESS:") {
+		t.Errorf("expected GLOBAL PROGRESS in rendered output, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "LIVE PROGRESS OUTPUT STREAM") {
+		t.Errorf("expected LIVE PROGRESS OUTPUT STREAM box in rendered output, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "lazygit") {
+		t.Errorf("expected lazygit in rendered output, got:\n%s", rendered)
+	}
+
+	// Now fail step 1 and succeed step 2
+	nm, _ = w.Update(wizardProgressMsg{
+		StepID:      1,
+		TotalSteps:  5,
+		Phase:       "Installing",
+		Action:      "install",
+		ResourceID:  "lazygit",
+		Description: "Simple terminal UI for Git",
+		Status:      domain.StepFailed,
+		Percent:     30,
+	})
+	nm, _ = nm.Update(wizardProgressMsg{
+		StepID:      2,
+		TotalSteps:  5,
+		Phase:       "Installing",
+		Action:      "install",
+		ResourceID:  "fzf",
+		Description: "Command-line fuzzy finder",
+		Status:      domain.StepSuccess,
+		Percent:     50,
+	})
+	w = nm.(WizardModel)
+	w.err = errors.New("step 1 (lazygit) failed: tier 1 failed")
+	w.stage = StageCompleted
+
+	completedView := w.renderCompleted(100)
+	if !strings.Contains(completedView, "SETUP COMPLETED WITH COMPONENT WARNINGS / ERRORS") {
+		t.Errorf("expected warnings/errors header in completed view, got:\n%s", completedView)
+	}
+	if !strings.Contains(completedView, "Succeeded (1 components)") || !strings.Contains(completedView, "fzf") {
+		t.Errorf("expected fzf in succeeded section, got:\n%s", completedView)
+	}
+	if !strings.Contains(completedView, "Failed Components (1)") || !strings.Contains(completedView, "lazygit") {
+		t.Errorf("expected lazygit in failed section, got:\n%s", completedView)
+	}
+}
+
+func TestWizardScrollingInApplyingAndCompletedStages(t *testing.T) {
+	deps := newTestDeps(t)
+	wiz := NewWizardModel(deps.Platform, deps.Catalog, nil)
+	wiz.width = 80
+	wiz.height = 20
+
+	// 1. Test StageApplying scrolling
+	wiz.stage = StageApplying
+	wiz.applyScrollOffset = 0
+
+	// Down key increases offset
+	nm, _ := wiz.Update(tea.KeyPressMsg{Text: "down"})
+	w := nm.(WizardModel)
+	if w.applyScrollOffset != 1 {
+		t.Errorf("expected applyScrollOffset=1 after down, got %d", w.applyScrollOffset)
+	}
+
+	// 'j' increases offset
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "j"})
+	w = nm.(WizardModel)
+	if w.applyScrollOffset != 2 {
+		t.Errorf("expected applyScrollOffset=2 after 'j', got %d", w.applyScrollOffset)
+	}
+
+	// MouseWheelDown increases offset
+	nm, _ = w.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	w = nm.(WizardModel)
+	if w.applyScrollOffset != 3 {
+		t.Errorf("expected applyScrollOffset=3 after MouseWheelDown, got %d", w.applyScrollOffset)
+	}
+
+	// 'k' decreases offset
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "k"})
+	w = nm.(WizardModel)
+	if w.applyScrollOffset != 2 {
+		t.Errorf("expected applyScrollOffset=2 after 'k', got %d", w.applyScrollOffset)
+	}
+
+	// Up decreases offset
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "up"})
+	w = nm.(WizardModel)
+	if w.applyScrollOffset != 1 {
+		t.Errorf("expected applyScrollOffset=1 after up, got %d", w.applyScrollOffset)
+	}
+
+	// MouseWheelUp decreases offset
+	nm, _ = w.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	w = nm.(WizardModel)
+	if w.applyScrollOffset != 0 {
+		t.Errorf("expected applyScrollOffset=0 after MouseWheelUp, got %d", w.applyScrollOffset)
+	}
+
+	// 2. Test StageCompleted scrolling
+	w.stage = StageCompleted
+	w.completedScrollOffset = 0
+
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "down"})
+	w = nm.(WizardModel)
+	if w.completedScrollOffset != 1 {
+		t.Errorf("expected completedScrollOffset=1 after down, got %d", w.completedScrollOffset)
+	}
+
+	nm, _ = w.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	w = nm.(WizardModel)
+	if w.completedScrollOffset != 2 {
+		t.Errorf("expected completedScrollOffset=2 after MouseWheelDown, got %d", w.completedScrollOffset)
+	}
+
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "up"})
+	w = nm.(WizardModel)
+	if w.completedScrollOffset != 1 {
+		t.Errorf("expected completedScrollOffset=1 after up, got %d", w.completedScrollOffset)
+	}
+
+	nm, _ = w.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	w = nm.(WizardModel)
+	if w.completedScrollOffset != 0 {
+		t.Errorf("expected completedScrollOffset=0 after MouseWheelUp, got %d", w.completedScrollOffset)
+	}
+}
+
+func TestWizardReviewPlanStickyToggles(t *testing.T) {
+	plat := platform.Detect()
+	cat := testutil.RichCatalog(t)
+	w := NewWizardModel(plat, cat, nil,
+		WithWizardIncludeHacks(true),
+		WithWizardIncludeOSConfig(true),
+		WithWizardDestroyerMode(false),
+	)
+	w.stage = StageReviewPlan
+	w.width = 100
+	w.height = 24
+
+	// Render view at scroll offset 0
+	view0 := w.View().Content
+	if !strings.Contains(view0, "TOGGLES (STICKY)") {
+		t.Fatalf("expected view to contain sticky toggles header, got:\n%s", view0)
+	}
+	if !strings.Contains(view0, "[o] OS Config:") || !strings.Contains(view0, "[Included ✓]") {
+		t.Fatalf("expected OS config included badge in sticky toggles, got:\n%s", view0)
+	}
+
+	// Scroll down deep into the plan
+	w.planScrollOffset = 30
+	viewScrolled := w.View().Content
+	if !strings.Contains(viewScrolled, "TOGGLES (STICKY)") {
+		t.Fatalf("expected sticky toggles to remain visible when scrolled to offset 30, got:\n%s", viewScrolled)
+	}
+
+	// Toggle Destroyer mode with 'd'
+	nm, _ := w.Update(tea.KeyPressMsg{Text: "d"})
+	w = nm.(WizardModel)
+	if !w.destroyerMode {
+		t.Fatalf("expected destroyerMode to become true after pressing 'd'")
+	}
+	viewDestroyer := w.View().Content
+	if !strings.Contains(viewDestroyer, "[d] Destroyer:") || !strings.Contains(viewDestroyer, "ACTIVE ⚠️") {
+		t.Fatalf("expected sticky bar to update with active destroyer badge, got:\n%s", viewDestroyer)
+	}
+
+	// Toggle OS Config with 'o'
+	nm, _ = w.Update(tea.KeyPressMsg{Text: "o"})
+	w = nm.(WizardModel)
+	if w.includeOSConfig {
+		t.Fatalf("expected includeOSConfig to become false after pressing 'o'")
+	}
+	viewNoOS := w.View().Content
+	if !strings.Contains(viewNoOS, "[o] OS Config:") || !strings.Contains(viewNoOS, "[Excluded]") {
+		t.Fatalf("expected sticky bar to update with excluded osconfig badge, got:\n%s", viewNoOS)
+	}
+}
+
+func TestWizardStageSelectProfileFiltersUnsupportedAndMarksEffectiveDeps(t *testing.T) {
+	cat := testutil.RichCatalog(t)
+	runner := security.NewRunner(0)
+
+	runProfileSelect := func(params platform.TestInfoParams) map[string]bool {
+		home := t.TempDir()
+		params.HomeDir = home
+		params.StateDir = filepath.Join(home, "state")
+		plat := platform.NewTestInfo(params)
+		disp := providers.NewDispatcher(plat, cat.Catalog(), runner, "")
+		svc := app.NewInstallService(app.InstallDeps{Platform: plat, Catalog: cat, Provider: disp})
+		w := NewWizardModel(plat, cat, svc)
+		for i, prof := range w.profiles {
+			if prof.Name == "workstation" {
+				w.selectedProf = i
+				break
+			}
+		}
+		nm, _ := w.Update(tea.KeyPressMsg{Text: "enter"})
+		return nm.(WizardModel).selectedPkgs
+	}
+
+	darwinSelected := runProfileSelect(platform.TestInfoParams{
+		OS:              "darwin",
+		Arch:            "arm64",
+		PackageManagers: []string{"brew"},
+	})
+	for _, unwanted := range []string{"build-essential", "ssl-dev", "xclip", "wmctrl", "xdotool"} {
+		if darwinSelected[unwanted] {
+			t.Errorf("darwin workstation wizard unexpectedly selected %q", unwanted)
+		}
+	}
+
+	waylandSelected := runProfileSelect(platform.TestInfoParams{
+		OS:              "linux",
+		Arch:            "amd64",
+		PackageManagers: []string{"apt"},
+		DisplayServer:   "wayland",
+	})
+	for _, unwanted := range []string{"xclip", "wmctrl", "xdotool"} {
+		if waylandSelected[unwanted] {
+			t.Errorf("linux wayland workstation wizard unexpectedly selected %q", unwanted)
+		}
+	}
+	if !waylandSelected["build-essential"] || !waylandSelected["ssl-dev"] {
+		t.Errorf("linux workstation wizard should mark linux pyenv deps build-essential and ssl-dev")
+	}
+
+	x11Selected := runProfileSelect(platform.TestInfoParams{
+		OS:              "linux",
+		Arch:            "amd64",
+		PackageManagers: []string{"apt"},
+		DisplayServer:   "x11",
+	})
+	for _, wanted := range []string{"xclip", "wmctrl", "xdotool"} {
+		if !x11Selected[wanted] {
+			t.Errorf("linux x11 workstation wizard missing X11 package %q", wanted)
+		}
+	}
+}
+
+func TestWizardReviewPlanOSConfigMatchesHostOS(t *testing.T) {
+	cat := testutil.RichCatalog(t)
+	home := t.TempDir()
+	platDarwin := platform.NewTestInfo(platform.TestInfoParams{
+		OS:              "darwin",
+		Arch:            "arm64",
+		PackageManagers: []string{"brew"},
+		DisplayServer:   "quartz",
+		HomeDir:         home,
+		StateDir:        filepath.Join(home, "state"),
+	})
+	w := NewWizardModel(platDarwin, cat, nil, WithWizardIncludeOSConfig(true))
+	w.stage = StageReviewPlan
+	w.width = 110
+	w.height = 36
+
+	view := w.View().Content
+	if !strings.Contains(view, "Amethyst") || !strings.Contains(view, "macos-osconfig") {
+		t.Errorf("expected darwin review plan osconfig section to describe Amethyst/macos-osconfig, got:\n%s", view)
+	}
+	if strings.Contains(view, "Karabiner") {
+		t.Errorf("darwin review plan should not include Karabiner by default, got:\n%s", view)
+	}
+	if strings.Contains(view, "GNOME Extension") {
+		t.Errorf("darwin review plan unexpectedly rendered Linux GNOME Extension description:\n%s", view)
+	}
+}
+
+func TestWizardDestroyerToggleReplansWithForceAndRendersOSConfigStatus(t *testing.T) {
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-seed minimal binaries so non-forced Plan skips them, while forced Destroyer Plan includes them.
+	for _, bin := range []string{"git", "curl", "htop", "jq", "fzf", "rg", "fd", "bat", "eza", "tree", "starship"} {
+		if err := os.WriteFile(filepath.Join(binDir, bin), []byte("#!/bin/sh\necho 1.0.0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", binDir)
+	plat := platform.NewTestInfo(platform.TestInfoParams{
+		OS:              "linux",
+		Arch:            "amd64",
+		PackageManagers: []string{"apt"},
+		HomeDir:         home,
+		LocalBinDir:     binDir,
+		StateDir:        filepath.Join(home, "state"),
+	})
+	cat := testutil.RichCatalog(t)
+	disp := providers.NewDispatcher(plat, cat.Catalog(), security.NewRunner(5*time.Second), "")
+	instSvc := app.NewInstallService(app.InstallDeps{
+		Platform: plat,
+		Catalog:  cat,
+		Provider: disp,
+	})
+
+	w := NewWizardModel(plat, cat, instSvc)
+	w.selectedPkgs = map[string]bool{"git": true, "curl": true, "fzf": true}
+	w.stage = StageReviewPlan
+
+	// Toggling [d] in StageReviewPlan must enter StagePlanning and return a plan command with destroyer=true.
+	nm, cmd := w.Update(tea.KeyPressMsg{Text: "d"})
+	w = nm.(WizardModel)
+	if !w.destroyerMode || w.stage != StagePlanning || cmd == nil {
+		t.Fatalf("expected [d] toggle in StageReviewPlan to enter StagePlanning with cmd, got destroyer=%v stage=%v cmd=%v", w.destroyerMode, w.stage, cmd)
+	}
+	rawMsg := cmd()
+	batch, ok := rawMsg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("expected tea.BatchMsg from StagePlanning trigger, got %T (%#v)", rawMsg, rawMsg)
+	}
+	var planMsg wizardPlanDoneMsg
+	foundPlan := false
+	for _, subCmd := range batch {
+		if subCmd == nil {
+			continue
+		}
+		if pm, ok := subCmd().(wizardPlanDoneMsg); ok {
+			planMsg = pm
+			foundPlan = true
+			break
+		}
+	}
+	if !foundPlan || planMsg.err != nil || planMsg.plan == nil {
+		t.Fatalf("expected wizardPlanDoneMsg with plan inside batch, got found=%v msg=%#v", foundPlan, planMsg)
+	}
+	if len(planMsg.plan.Steps) < 3 {
+		t.Fatalf("expected destroyer force plan to reschedule all 3 pre-installed packages, got %d steps", len(planMsg.plan.Steps))
+	}
+
+	// Verify StageCompleted renders reconciled count + explicit OS Configuration status even when err == nil.
+	w.stage = StageCompleted
+	w.width = 100
+	w.height = 40
+	w.succeededItems = []string{"git", "curl", "fzf"}
+	w.osConfigStatus = "applied with warnings (privileged steps skipped: --no-sudo)"
+	view := w.View().Content
+	if !strings.Contains(view, "Reconciled (3 components)") {
+		t.Errorf("expected StageCompleted to show reconciled component count, got:\n%s", view)
+	}
+	if !strings.Contains(view, "OS Configuration (osconfig)") || !strings.Contains(view, "--no-sudo") {
+		t.Errorf("expected StageCompleted to explicitly show OS Configuration warning status, got:\n%s", view)
+	}
+}
+
+func TestOrderProfilesForWizard(t *testing.T) {
+	in := []domain.Profile{{Name: "minimal"}, {Name: "zzz"}, {Name: "full"}, {Name: "developer"}, {Name: "editor"}, {Name: "terminal"}, {Name: "headless"}, {Name: "workstation"}, {Name: "ai-workstation"}}
+	var got []string
+	for _, p := range orderProfilesForWizard(in) {
+		got = append(got, p.Name)
+	}
+	want := "full,workstation,ai-workstation,developer,terminal,editor,headless,minimal,zzz"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("got %v", got)
+	}
+}

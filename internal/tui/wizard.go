@@ -1,0 +1,2288 @@
+package tui
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/arturonavax/anx/internal/app"
+	"github.com/arturonavax/anx/internal/catalog"
+	"github.com/arturonavax/anx/internal/domain"
+	"github.com/arturonavax/anx/internal/platform"
+	"github.com/arturonavax/anx/internal/security"
+	"github.com/arturonavax/anx/internal/state"
+	"github.com/arturonavax/anx/internal/theme"
+	"github.com/charmbracelet/x/ansi"
+)
+
+// WizardStage tracks which screen of the wizard is active.
+type WizardStage int
+
+const (
+	StageSelectProfile WizardStage = iota
+	StageSelectEnvironment
+	StageSelectPackages
+	StagePlanning
+	StageReviewPlan
+	StageApplying
+	StageCompleted
+)
+
+type wizardApplyDoneMsg struct {
+	err            error
+	logPath        string
+	osConfigStatus string
+	osConfigErr    error
+}
+
+type wizardSudoAuthMsg struct {
+	err error
+}
+
+type activeWorkerSlot struct {
+	StepID      int
+	ResourceID  string
+	Action      string
+	Description string
+	StartedAt   time.Time
+	Outputs     []string
+}
+
+type wizardProgressMsg struct {
+	StepID      int
+	TotalSteps  int
+	Phase       string
+	Action      string
+	ResourceID  string
+	Description string
+	Status      domain.StepStatus
+	Percent     int
+	OutputLine  string
+}
+
+type wizardPlanDoneMsg struct {
+	plan  *domain.ExecutionPlan
+	diffs []app.ConfigDiff
+	err   error
+}
+
+func waitForProgressCmd(ch <-chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return msg
+	}
+}
+
+type wizardSpinnerTickMsg time.Time
+
+func tickSpinnerCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg {
+		return wizardSpinnerTickMsg(t)
+	})
+}
+
+// ShellOption defines a selectable shell with feature indicators.
+type ShellOption struct {
+	ID          string
+	Name        string
+	Badge       string
+	Description string
+}
+
+// TerminalOption defines a selectable terminal with compatibility notes.
+type TerminalOption struct {
+	ID          string
+	Name        string
+	Badge       string
+	Description string
+	Warning     string
+}
+
+// WizardModel represents the interactive setup interview wizard.
+type WizardModel struct {
+	width                 int
+	height                int
+	stage                 WizardStage
+	styles                *theme.Styles
+	platform              *platform.Info
+	catalog               *catalog.Registry
+	installSvc            *app.InstallService
+	profiles              []domain.Profile
+	selectedProf          int
+	packages              []domain.ManagedResource
+	selectedPkgs          map[string]bool
+	pkgMap                map[string]domain.ManagedResource
+	requiredBy            map[string][]string
+	pkgCursor             int
+	pkgScrollOffset       int
+	planScrollOffset      int
+	applyScrollOffset     int
+	completedScrollOffset int
+	spinnerFrame          int
+	plan                  *domain.ExecutionPlan
+	progressStep          int
+	progressTotal         int
+	progressPhase         string
+	progressAction        string
+	progressResource      string
+	progressDesc          string
+	progressPercent       int
+	progressChan          chan tea.Msg
+	progressMsg           string
+	activeWorkers         map[int]activeWorkerSlot
+	activeWorkerOrder     []int
+	recentCompleted       []string
+	completedSteps        int
+	workerLogs            map[int][]string
+	recentOutputLines     []string
+	failedItems           []string
+	skippedItems          []string
+	succeededItems        []string
+	osConfigStatus        string
+	osConfigErr           error
+	installLogPath        string
+	err                   error
+	quitting              bool
+	matchedHacks          []domain.HackProfile
+	includeHacks          bool
+	includeOSConfig       bool
+	configDiffs           []app.ConfigDiff
+	syncSvc               *app.SyncService
+	hacksSvc              *app.HacksService
+	shells                []ShellOption
+	terminals             []TerminalOption
+	selectedShell         string
+	selectedTerminal      string
+	shellCursor           int
+	terminalCursor        int
+	envFocus              string // "shell" or "terminal"
+	destroyerMode         bool
+	destroyerSvc          *app.DestroyerService
+	seal                  *security.OriginSeal
+	store                 *state.Store
+	sudoErr               error
+	sudoCheckFn           func() bool
+	sudoAuthCmdFn         func() *exec.Cmd
+}
+
+func defaultShellOptions() []ShellOption {
+	return []ShellOption{
+		{ID: "zsh", Name: "Zsh", Badge: "[Recommended ✓]", Description: "Primary source of truth (fzf-tab, SQLite Atuin, Starship, zcompile)"},
+		{ID: "bash", Name: "Bash", Badge: "[Adapter]", Description: "Adapted ~/.base.bash with Starship, Atuin, FZF and aliases"},
+		{ID: "fish", Name: "Fish", Badge: "[Adapter]", Description: "Fish shell config with Starship, Atuin, and FZF keybindings"},
+		{ID: "nu", Name: "Nushell", Badge: "[Adapter]", Description: "Nushell environment with Starship & Atuin hooks"},
+	}
+}
+
+func defaultTerminalOptions() []TerminalOption {
+	return []TerminalOption{
+		{ID: "ghostty", Name: "Ghostty", Badge: "[Recommended ✓]", Description: "GPU terminal with Herdr multiplexer, split panes, 24-bit TrueColor", Warning: ""},
+		{ID: "kitty", Name: "Kitty", Badge: "[Supported ✓]", Description: "Fast GPU terminal with Kitty graphics, Tokyo Night theme, Herdr", Warning: ""},
+		{ID: "wezterm", Name: "WezTerm", Badge: "[Supported ✓]", Description: "Cross-platform GPU terminal with Lua configuration and Herdr", Warning: ""},
+		{ID: "alacritty", Name: "Alacritty", Badge: "[Supported ✓]", Description: "Ultra-fast OpenGL terminal with Tokyo Night theme and Herdr", Warning: ""},
+		{ID: "windows-terminal", Name: "Windows Terminal", Badge: "[Partial ⚠️]", Description: "Microsoft Windows Terminal with tabs and split panes", Warning: "POSIX signals and socket multiplexing require WSL"},
+		{ID: "warp", Name: "Warp", Badge: "[Limited ⚠️]", Description: "Proprietary AI command-block terminal", Warning: "Starship prompt, FZF widgets, and Herdr are disabled by Warp's design"},
+	}
+}
+
+// WizardOption configures optional parameters for the setup wizard.
+type WizardOption func(*WizardModel)
+
+// WithWizardMatchedHacks injects detected hardware hacks into the wizard.
+func WithWizardMatchedHacks(hacks []domain.HackProfile) WizardOption {
+	return func(w *WizardModel) {
+		w.matchedHacks = hacks
+	}
+}
+
+// WithWizardIncludeHacks sets initial hack opt-in state.
+func WithWizardIncludeHacks(include bool) WizardOption {
+	return func(w *WizardModel) {
+		w.includeHacks = include
+	}
+}
+
+// WithWizardIncludeOSConfig sets initial desktop & OS config inclusion state.
+func WithWizardIncludeOSConfig(include bool) WizardOption {
+	return func(w *WizardModel) {
+		w.includeOSConfig = include
+	}
+}
+
+// WithWizardConfigDiffs injects detected dotfile diffs into the wizard.
+func WithWizardConfigDiffs(diffs []app.ConfigDiff) WizardOption {
+	return func(w *WizardModel) {
+		w.configDiffs = diffs
+	}
+}
+
+// WithWizardSyncService injects SyncService for dotfile reconciliation during apply.
+func WithWizardSyncService(svc *app.SyncService) WizardOption {
+	return func(w *WizardModel) {
+		w.syncSvc = svc
+	}
+}
+
+// WithWizardHacksService injects HacksService for applying matched workstation hacks.
+func WithWizardHacksService(svc *app.HacksService) WizardOption {
+	return func(w *WizardModel) {
+		w.hacksSvc = svc
+	}
+}
+
+// WithWizardDestroyerSvc injects DestroyerService into the wizard.
+func WithWizardDestroyerSvc(svc *app.DestroyerService) WizardOption {
+	return func(w *WizardModel) {
+		w.destroyerSvc = svc
+	}
+}
+
+// WithWizardDestroyerMode sets the initial destroyer reinstall mode in the wizard.
+func WithWizardDestroyerMode(enable bool) WizardOption {
+	return func(w *WizardModel) {
+		w.destroyerMode = enable
+	}
+}
+
+// WithWizardSecuritySeal injects the cryptographic origin seal into the wizard.
+func WithWizardSecuritySeal(seal *security.OriginSeal) WizardOption {
+	return func(w *WizardModel) {
+		w.seal = seal
+	}
+}
+
+// WithWizardStore injects the transactional state store into the wizard.
+func WithWizardStore(store *state.Store) WizardOption {
+	return func(w *WizardModel) {
+		w.store = store
+	}
+}
+
+// WithWizardSudoChecker overrides the sudo credential check function (primarily for testing).
+func WithWizardSudoChecker(fn func() bool) WizardOption {
+	return func(w *WizardModel) {
+		if fn != nil {
+			w.sudoCheckFn = fn
+		}
+	}
+}
+
+// WithWizardSudoAuthCmd overrides the sudo auth command factory (primarily for testing).
+func WithWizardSudoAuthCmd(fn func() *exec.Cmd) WizardOption {
+	return func(w *WizardModel) {
+		if fn != nil {
+			w.sudoAuthCmdFn = fn
+		}
+	}
+}
+
+// ChosenProfile returns the currently selected profile name in the wizard.
+func (w WizardModel) ChosenProfile() string {
+	if len(w.profiles) > 0 && w.selectedProf < len(w.profiles) {
+		return w.profiles[w.selectedProf].Name
+	}
+	return ""
+}
+
+// IsCompleted returns true if the wizard finished applying successfully.
+func (w WizardModel) IsCompleted() bool {
+	return w.stage == StageCompleted && w.err == nil
+}
+
+// NewWizardModel creates an upfront interactive wizard model.
+func NewWizardModel(
+	plat *platform.Info,
+	cat *catalog.Registry,
+	svc *app.InstallService,
+	opts ...WizardOption,
+) WizardModel {
+	_, _ = security.EnsureSudoPAMHealthy()
+	var pkgs []domain.ManagedResource
+	var profs []domain.Profile
+	if cat != nil {
+		pkgs = cat.ListPackages()
+		profs = orderProfilesForWizard(cat.ListProfiles())
+	}
+
+	pkgMap := make(map[string]domain.ManagedResource, len(pkgs))
+	requiredBy := make(map[string][]string)
+	for i := range pkgs {
+		if svc != nil {
+			pkgs[i].DependsOn = svc.EffectiveDependencies(pkgs[i].ID)
+		}
+		p := pkgs[i]
+		pkgMap[p.ID] = p
+		for _, dep := range p.DependsOn {
+			requiredBy[dep] = append(requiredBy[dep], p.ID)
+		}
+	}
+	for k := range requiredBy {
+		sort.Strings(requiredBy[k])
+	}
+
+	var directTools []domain.ManagedResource
+	var dependencies []domain.ManagedResource
+	for _, p := range pkgs {
+		if p.IsDirectTool(requiredBy) {
+			directTools = append(directTools, p)
+		} else {
+			dependencies = append(dependencies, p)
+		}
+	}
+	sort.Slice(directTools, func(i, j int) bool {
+		return directTools[i].ID < directTools[j].ID
+	})
+	sort.Slice(dependencies, func(i, j int) bool {
+		return dependencies[i].ID < dependencies[j].ID
+	})
+	orderedPkgs := append(directTools, dependencies...)
+
+	selected := make(map[string]bool)
+	for _, p := range orderedPkgs {
+		selected[p.ID] = true // Default select all
+	}
+
+	shells := defaultShellOptions()
+	terminals := defaultTerminalOptions()
+	selectedShell := "zsh"
+	selectedTerminal := "ghostty"
+
+	shellIdx := 0
+	if plat != nil && plat.CurrentShell() != "" {
+		for i, s := range shells {
+			if s.ID == plat.CurrentShell() {
+				shellIdx = i
+				selectedShell = s.ID
+				break
+			}
+		}
+	}
+
+	termIdx := 0
+	if plat != nil && plat.CurrentTerminal() != "" {
+		for i, t := range terminals {
+			if t.ID == plat.CurrentTerminal() {
+				termIdx = i
+				selectedTerminal = t.ID
+				break
+			}
+		}
+	}
+
+	m := WizardModel{
+		stage:             StageSelectProfile,
+		styles:            theme.DefaultStyles(),
+		platform:          plat,
+		catalog:           cat,
+		installSvc:        svc,
+		profiles:          profs,
+		selectedProf:      0,
+		packages:          orderedPkgs,
+		selectedPkgs:      selected,
+		pkgMap:            pkgMap,
+		requiredBy:        requiredBy,
+		pkgCursor:         0,
+		shells:            shells,
+		terminals:         terminals,
+		selectedShell:     selectedShell,
+		selectedTerminal:  selectedTerminal,
+		shellCursor:       shellIdx,
+		terminalCursor:    termIdx,
+		envFocus:          "shell",
+		includeOSConfig:   true,
+		sudoCheckFn:       security.IsSudoAuthenticated,
+		sudoAuthCmdFn:     security.NewSudoAuthCmd,
+		activeWorkers:     make(map[int]activeWorkerSlot),
+		activeWorkerOrder: make([]int, 0),
+		recentCompleted:   make([]string, 0),
+		workerLogs:        make(map[int][]string),
+		recentOutputLines: make([]string, 0),
+		failedItems:       make([]string, 0),
+		succeededItems:    make([]string, 0),
+		width:             80,
+		height:            24,
+	}
+
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&m)
+		}
+	}
+
+	return m
+}
+
+// Init implements tea.Model.
+func (w WizardModel) Init() tea.Cmd {
+	return nil
+}
+
+// Update handles keyboard and window resize events in the wizard.
+func (w WizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyPressMsg:
+		switch msg.String() {
+		case "q", "ctrl+c":
+			w.quitting = true
+			return w, tea.Quit
+
+		case "esc":
+			switch w.stage {
+			case StageSelectProfile:
+				w.quitting = true
+				return w, tea.Quit
+			case StageSelectEnvironment:
+				w.stage = StageSelectProfile
+				return w, nil
+			case StageSelectPackages:
+				w.stage = StageSelectEnvironment
+				return w, nil
+			case StagePlanning:
+				w.stage = StageSelectPackages
+				return w, nil
+			case StageReviewPlan:
+				w.stage = StageSelectPackages
+				return w, nil
+			case StageCompleted:
+				w.quitting = true
+				return w, tea.Quit
+			}
+
+		case "up", "k":
+			switch w.stage {
+			case StageSelectProfile:
+				if w.selectedProf > 0 {
+					w.selectedProf--
+				}
+			case StageSelectEnvironment:
+				if w.envFocus == "shell" {
+					if w.shellCursor > 0 {
+						w.shellCursor--
+					}
+				} else {
+					if w.terminalCursor > 0 {
+						w.terminalCursor--
+					}
+				}
+			case StageSelectPackages:
+				if w.pkgCursor > 0 {
+					w.pkgCursor--
+				}
+				w.adjustPkgScroll()
+			case StageReviewPlan:
+				if w.planScrollOffset > 0 {
+					w.planScrollOffset--
+				}
+			case StageApplying:
+				if w.applyScrollOffset > 0 {
+					w.applyScrollOffset--
+				}
+			case StageCompleted:
+				if w.completedScrollOffset > 0 {
+					w.completedScrollOffset--
+				}
+			}
+
+		case "down", "j":
+			switch w.stage {
+			case StageSelectProfile:
+				if w.selectedProf < len(w.profiles)-1 {
+					w.selectedProf++
+				}
+			case StageSelectEnvironment:
+				if w.envFocus == "shell" {
+					if w.shellCursor < len(w.shells)-1 {
+						w.shellCursor++
+					}
+				} else {
+					if w.terminalCursor < len(w.terminals)-1 {
+						w.terminalCursor++
+					}
+				}
+			case StageSelectPackages:
+				if w.pkgCursor < len(w.packages)-1 {
+					w.pkgCursor++
+				}
+				w.adjustPkgScroll()
+			case StageReviewPlan:
+				w.planScrollOffset++
+			case StageApplying:
+				w.applyScrollOffset++
+			case StageCompleted:
+				w.completedScrollOffset++
+			}
+
+		case "pgup", "ctrl+u":
+			switch w.stage {
+			case StageSelectPackages:
+				w.pkgCursor -= 5
+				if w.pkgCursor < 0 {
+					w.pkgCursor = 0
+				}
+				w.adjustPkgScroll()
+			case StageReviewPlan:
+				w.planScrollOffset -= 5
+				if w.planScrollOffset < 0 {
+					w.planScrollOffset = 0
+				}
+			case StageApplying:
+				w.applyScrollOffset -= 5
+				if w.applyScrollOffset < 0 {
+					w.applyScrollOffset = 0
+				}
+			case StageCompleted:
+				w.completedScrollOffset -= 5
+				if w.completedScrollOffset < 0 {
+					w.completedScrollOffset = 0
+				}
+			}
+
+		case "pgdown", "ctrl+d":
+			switch w.stage {
+			case StageSelectPackages:
+				w.pkgCursor += 5
+				if w.pkgCursor >= len(w.packages) {
+					w.pkgCursor = len(w.packages) - 1
+				}
+				w.adjustPkgScroll()
+			case StageReviewPlan:
+				w.planScrollOffset += 5
+			case StageApplying:
+				w.applyScrollOffset += 5
+			case StageCompleted:
+				w.completedScrollOffset += 5
+			}
+
+		case "tab", "left", "right":
+			if w.stage == StageSelectEnvironment {
+				if w.envFocus == "shell" {
+					w.envFocus = "terminal"
+				} else {
+					w.envFocus = "shell"
+				}
+			}
+
+		case " ", "space":
+			if w.stage == StageSelectEnvironment {
+				if w.envFocus == "shell" && w.shellCursor < len(w.shells) {
+					w.selectedShell = w.shells[w.shellCursor].ID
+				} else if w.envFocus == "terminal" && w.terminalCursor < len(w.terminals) {
+					w.selectedTerminal = w.terminals[w.terminalCursor].ID
+				}
+			} else if w.stage == StageSelectPackages && len(w.packages) > 0 {
+				pkgID := w.packages[w.pkgCursor].ID
+				w.togglePackage(pkgID)
+			}
+
+		case "h":
+			if len(w.matchedHacks) > 0 {
+				w.includeHacks = !w.includeHacks
+			}
+
+		case "o", "O":
+			w.includeOSConfig = !w.includeOSConfig
+
+		case "d", "D":
+			w.destroyerMode = !w.destroyerMode
+			if w.stage == StageReviewPlan && w.installSvc != nil {
+				w.stage = StagePlanning
+				cmd := runWizardPlanCmd(w.installSvc, w.syncSvc, w.ChosenProfile(), w.selectedPackageList(), w.destroyerMode)
+				return w, tea.Batch(cmd, tickSpinnerCmd())
+			}
+
+		case "enter":
+			switch w.stage {
+			case StageSelectProfile:
+				if len(w.profiles) > 0 && w.catalog != nil {
+					prof := w.profiles[w.selectedProf]
+					if resolved, err := w.catalog.ResolveProfilePackages(prof.Name); err == nil {
+						w.selectedPkgs = make(map[string]bool)
+						for _, p := range resolved {
+							if !w.isPkgSupported(p) {
+								continue
+							}
+							w.selectedPkgs[p] = true
+						}
+						for _, p := range resolved {
+							if w.isPkgSupported(p) {
+								w.markDependencies(p)
+							}
+						}
+					}
+				}
+				w.stage = StageSelectEnvironment
+
+			case StageSelectEnvironment:
+				if w.shellCursor < len(w.shells) {
+					w.selectedShell = w.shells[w.shellCursor].ID
+				}
+				if w.terminalCursor < len(w.terminals) {
+					w.selectedTerminal = w.terminals[w.terminalCursor].ID
+				}
+				w.stage = StageSelectPackages
+
+			case StageSelectPackages:
+				selectedList := w.selectedPackageList()
+				w.stage = StagePlanning
+				cmd := runWizardPlanCmd(w.installSvc, w.syncSvc, w.ChosenProfile(), selectedList, w.destroyerMode)
+				return w, tea.Batch(cmd, tickSpinnerCmd())
+
+			case StageReviewPlan:
+				if w.needsSudo() && w.sudoCheckFn != nil && !w.sudoCheckFn() {
+					authCmd := security.NewSudoAuthCmd()
+					if w.sudoAuthCmdFn != nil {
+						authCmd = w.sudoAuthCmdFn()
+					}
+					return w, tea.ExecProcess(authCmd, func(err error) tea.Msg {
+						return wizardSudoAuthMsg{err: err}
+					})
+				}
+				return w.startApplying()
+
+			case StageCompleted:
+				w.quitting = true
+				return w, tea.Quit
+			}
+		}
+
+	case tea.MouseWheelMsg:
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			switch w.stage {
+			case StageSelectProfile:
+				if w.selectedProf > 0 {
+					w.selectedProf--
+				}
+			case StageSelectEnvironment:
+				if w.envFocus == "shell" && w.shellCursor > 0 {
+					w.shellCursor--
+				} else if w.envFocus == "terminal" && w.terminalCursor > 0 {
+					w.terminalCursor--
+				}
+			case StageSelectPackages:
+				if w.pkgCursor > 0 {
+					w.pkgCursor--
+				}
+				w.adjustPkgScroll()
+			case StageReviewPlan:
+				if w.planScrollOffset > 0 {
+					w.planScrollOffset--
+				}
+			case StageApplying:
+				if w.applyScrollOffset > 0 {
+					w.applyScrollOffset--
+				}
+			case StageCompleted:
+				if w.completedScrollOffset > 0 {
+					w.completedScrollOffset--
+				}
+			}
+		case tea.MouseWheelDown:
+			switch w.stage {
+			case StageSelectProfile:
+				if w.selectedProf < len(w.profiles)-1 {
+					w.selectedProf++
+				}
+			case StageSelectEnvironment:
+				if w.envFocus == "shell" && w.shellCursor < len(w.shells)-1 {
+					w.shellCursor++
+				} else if w.envFocus == "terminal" && w.terminalCursor < len(w.terminals)-1 {
+					w.terminalCursor++
+				}
+			case StageSelectPackages:
+				if w.pkgCursor < len(w.packages)-1 {
+					w.pkgCursor++
+				}
+				w.adjustPkgScroll()
+			case StageReviewPlan:
+				w.planScrollOffset++
+			case StageApplying:
+				w.applyScrollOffset++
+			case StageCompleted:
+				w.completedScrollOffset++
+			}
+		}
+
+	case wizardPlanDoneMsg:
+		if w.stage != StagePlanning {
+			return w, nil
+		}
+		if msg.err != nil {
+			w.err = msg.err
+			w.stage = StageCompleted
+			return w, nil
+		}
+		w.plan = msg.plan
+		w.configDiffs = msg.diffs
+		w.planScrollOffset = 0
+		w.stage = StageReviewPlan
+		return w, nil
+
+	case wizardProgressMsg:
+		w.progressStep = msg.StepID
+		w.progressTotal = msg.TotalSteps
+		w.progressPhase = msg.Phase
+		w.progressAction = msg.Action
+		w.progressResource = msg.ResourceID
+		w.progressDesc = msg.Description
+		w.progressPercent = msg.Percent
+
+		if w.activeWorkers == nil {
+			w.activeWorkers = make(map[int]activeWorkerSlot)
+		}
+		if w.workerLogs == nil {
+			w.workerLogs = make(map[int][]string)
+		}
+
+		if msg.OutputLine != "" {
+			lines := w.workerLogs[msg.StepID]
+			lines = append(lines, msg.OutputLine)
+			if len(lines) > 20 {
+				lines = lines[len(lines)-20:]
+			}
+			w.workerLogs[msg.StepID] = lines
+
+			tag := msg.ResourceID
+			if tag == "" {
+				tag = msg.Phase
+			}
+			w.recentOutputLines = append(w.recentOutputLines, fmt.Sprintf("[%s] %s", tag, msg.OutputLine))
+			if len(w.recentOutputLines) > 40 {
+				w.recentOutputLines = w.recentOutputLines[len(w.recentOutputLines)-40:]
+			}
+		}
+
+		if msg.Status == domain.StepRunning {
+			slot, exists := w.activeWorkers[msg.StepID]
+			if !exists {
+				w.activeWorkerOrder = append(w.activeWorkerOrder, msg.StepID)
+				slot = activeWorkerSlot{
+					StepID:      msg.StepID,
+					ResourceID:  msg.ResourceID,
+					Action:      msg.Action,
+					Description: msg.Description,
+					StartedAt:   time.Now(),
+				}
+			}
+			if msg.OutputLine != "" {
+				slot.Outputs = append(slot.Outputs, msg.OutputLine)
+				if len(slot.Outputs) > 5 {
+					slot.Outputs = slot.Outputs[len(slot.Outputs)-5:]
+				}
+			}
+			w.activeWorkers[msg.StepID] = slot
+		} else if msg.Status == domain.StepSuccess || msg.Status == domain.StepFailed || msg.Status == domain.StepSkipped {
+			switch msg.Status {
+			case domain.StepSuccess:
+				w.succeededItems = append(w.succeededItems, msg.ResourceID)
+			case domain.StepFailed:
+				detail := msg.Description
+				if msg.OutputLine != "" {
+					detail = msg.OutputLine
+				}
+				w.failedItems = append(w.failedItems, fmt.Sprintf("%s (%s)", msg.ResourceID, detail))
+			case domain.StepSkipped:
+				w.skippedItems = append(w.skippedItems, msg.ResourceID)
+			}
+			if _, exists := w.activeWorkers[msg.StepID]; exists {
+				delete(w.activeWorkers, msg.StepID)
+				for i, id := range w.activeWorkerOrder {
+					if id == msg.StepID {
+						w.activeWorkerOrder = append(w.activeWorkerOrder[:i], w.activeWorkerOrder[i+1:]...)
+						break
+					}
+				}
+				w.completedSteps++
+			}
+			badge := "✔"
+			switch msg.Status {
+			case domain.StepFailed:
+				badge = "✖"
+			case domain.StepSkipped:
+				badge = "ℹ"
+			}
+			act := msg.Action
+			if act == "" {
+				act = "install"
+			}
+			rec := fmt.Sprintf("%s %s [%s]", badge, msg.ResourceID, strings.ToUpper(act))
+			w.recentCompleted = append(w.recentCompleted, rec)
+			if len(w.recentCompleted) > 5 {
+				w.recentCompleted = w.recentCompleted[len(w.recentCompleted)-5:]
+			}
+		}
+
+		return w, waitForProgressCmd(w.progressChan)
+
+	case wizardSudoAuthMsg:
+		if msg.err != nil {
+			w.sudoErr = msg.err
+			return w, nil
+		}
+		w.sudoErr = nil
+		_, _ = security.SanitizeSudoLocalPAM(context.Background())
+		return w.startApplying()
+
+	case wizardApplyDoneMsg:
+		w.err = msg.err
+		w.installLogPath = msg.logPath
+		w.osConfigStatus = msg.osConfigStatus
+		w.osConfigErr = msg.osConfigErr
+		if msg.err == nil && w.store != nil {
+			prof := w.ChosenProfile()
+			if prof != "" {
+				_ = w.store.SetActiveProfile(prof)
+			}
+		}
+		w.stage = StageCompleted
+		return w, nil
+
+	case wizardSpinnerTickMsg:
+		if w.stage == StageApplying || w.stage == StagePlanning {
+			w.spinnerFrame++
+			return w, tickSpinnerCmd()
+		}
+		return w, nil
+
+	case tea.WindowSizeMsg:
+		w.width = msg.Width
+		w.height = msg.Height
+		w.adjustPkgScroll()
+	}
+
+	return w, nil
+}
+
+func (w *WizardModel) adjustPkgScroll() {
+	availHeight := w.visiblePkgLines()
+	w.pkgScrollOffset = AdjustScrollOffset(w.pkgCursor, w.pkgScrollOffset, availHeight, len(w.packages))
+}
+
+func (w *WizardModel) togglePackage(pkgID string) {
+	newVal := !w.selectedPkgs[pkgID]
+	w.selectedPkgs[pkgID] = newVal
+
+	if newVal {
+		w.markDependencies(pkgID)
+	} else {
+		w.unmarkDependents(pkgID)
+	}
+}
+
+func (w *WizardModel) isPkgSupported(pkgID string) bool {
+	if w.platform == nil {
+		return true
+	}
+	p, ok := w.pkgMap[pkgID]
+	if !ok {
+		return true
+	}
+	return p.SupportsOS(w.platform.OS()) && p.SupportsDisplayServer(w.platform.DisplayServer())
+}
+
+func (w *WizardModel) markDependencies(pkgID string) {
+	p, ok := w.pkgMap[pkgID]
+	if !ok {
+		return
+	}
+	for _, dep := range p.DependsOn {
+		if !w.isPkgSupported(dep) {
+			continue
+		}
+		if !w.selectedPkgs[dep] {
+			w.selectedPkgs[dep] = true
+			w.markDependencies(dep)
+		}
+	}
+}
+
+func (w *WizardModel) unmarkDependents(pkgID string) {
+	for _, parentID := range w.requiredBy[pkgID] {
+		if w.selectedPkgs[parentID] {
+			w.selectedPkgs[parentID] = false
+			w.unmarkDependents(parentID)
+		}
+	}
+}
+
+func (w WizardModel) visiblePkgLines() int {
+	h := w.height - 4
+	if h < 6 {
+		h = 6
+	}
+	avail := h - 3 - 5
+	if avail < 5 {
+		avail = 5
+	}
+	return avail
+}
+
+func (w WizardModel) needsSudo() bool {
+	if w.platform == nil || w.platform.IsRoot() || w.platform.IsTermux() || w.platform.OS() == "windows" || !w.platform.HasSudo() {
+		return false
+	}
+	if w.destroyerMode {
+		return true
+	}
+	if w.includeOSConfig && w.platform.OS() == "darwin" {
+		return true
+	}
+	if w.includeHacks {
+		for _, hk := range w.matchedHacks {
+			for _, st := range hk.Steps {
+				if st.Privileged {
+					return true
+				}
+			}
+		}
+	}
+	if w.installSvc != nil && w.plan != nil {
+		return w.installSvc.PlanRequiresSudo(w.plan)
+	}
+	return false
+}
+
+func (w WizardModel) selectedPackageList() []string {
+	selectedList := make([]string, 0, len(w.selectedPkgs))
+	for id, enabled := range w.selectedPkgs {
+		if enabled {
+			selectedList = append(selectedList, id)
+		}
+	}
+	sort.Strings(selectedList)
+	return selectedList
+}
+
+func (w WizardModel) startApplying() (tea.Model, tea.Cmd) {
+	w.stage = StageApplying
+	w.failedItems = nil
+	w.skippedItems = nil
+	w.succeededItems = nil
+	w.recentCompleted = nil
+	w.osConfigStatus = ""
+	w.osConfigErr = nil
+	profName := ""
+	if len(w.profiles) > 0 && w.selectedProf < len(w.profiles) {
+		profName = w.profiles[w.selectedProf].Name
+	}
+	selectedList := w.selectedPackageList()
+
+	progressChan := make(chan tea.Msg, 128)
+	w.progressChan = progressChan
+	w.progressStep = 0
+	w.progressTotal = 1
+	w.progressPhase = "Initializing"
+	w.progressPercent = 0
+
+	go runWizardApplyWorker(
+		w.seal,
+		w.destroyerMode,
+		w.destroyerSvc,
+		profName,
+		w.installSvc,
+		w.plan,
+		selectedList,
+		w.hacksSvc,
+		w.includeHacks,
+		w.includeOSConfig,
+		w.matchedHacks,
+		w.syncSvc,
+		w.selectedShell,
+		w.selectedTerminal,
+		w.store,
+		progressChan,
+	)
+	return w, tea.Batch(waitForProgressCmd(progressChan), tickSpinnerCmd())
+}
+
+func runWizardPlanCmd(installSvc *app.InstallService, syncSvc *app.SyncService, profName string, selectedList []string, destroyerMode bool) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		var plan *domain.ExecutionPlan
+		var err error
+		if installSvc != nil {
+			targetProf := ""
+			if len(selectedList) == 0 {
+				targetProf = profName
+			}
+			plan, err = installSvc.PlanWithReinstall(ctx, targetProf, selectedList, destroyerMode)
+		}
+		var diffs []app.ConfigDiff
+		if syncSvc != nil {
+			diffs, _ = syncSvc.Diff(ctx, "all")
+		}
+		return wizardPlanDoneMsg{
+			plan:  plan,
+			diffs: diffs,
+			err:   err,
+		}
+	}
+}
+
+func runWizardApplyWorker(
+	seal *security.OriginSeal,
+	destroyerMode bool,
+	destroyerSvc *app.DestroyerService,
+	profName string,
+	installSvc *app.InstallService,
+	plan *domain.ExecutionPlan,
+	selectedList []string,
+	hacksSvc *app.HacksService,
+	includeHacks bool,
+	includeOSConfig bool,
+	matchedHacks []domain.HackProfile,
+	syncSvc *app.SyncService,
+	selectedShell string,
+	selectedTerminal string,
+	store *state.Store,
+	progressChan chan<- tea.Msg,
+) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var logPath string
+	if installSvc != nil {
+		logPath = installSvc.InstallLogPath()
+	}
+
+	if security.IsSudoAuthenticated() {
+		stopKeepalive := security.StartSudoKeepalive(ctx)
+		defer stopKeepalive()
+	}
+
+	// 1. Verify Origin Seal
+	if seal != nil {
+		progressChan <- wizardProgressMsg{
+			StepID:      1,
+			TotalSteps:  1,
+			Phase:       "Verification",
+			Action:      "verify",
+			ResourceID:  "origin-seal",
+			Description: "Verifying cryptographic origin seal...",
+			Percent:     2,
+		}
+		if err := seal.Verify(ctx); err != nil {
+			progressChan <- wizardApplyDoneMsg{err: err, logPath: logPath}
+			return
+		}
+	}
+
+	// 2. Destroyer Purge Phase
+	if destroyerMode && destroyerSvc != nil {
+		progressChan <- wizardProgressMsg{
+			StepID:      0,
+			TotalSteps:  1,
+			Phase:       "Purging (Destroyer)",
+			Action:      "plan",
+			ResourceID:  "destroyer",
+			Description: "Planning deep system purge...",
+			Percent:     5,
+		}
+		opts := app.PurgeOptions{
+			Profile:       profName,
+			PurgeBinaries: false,
+			PurgeState:    false,
+		}
+		if purgePlan, err := destroyerSvc.PlanPurge(ctx, opts); err == nil {
+			destroyerSvc.SetOnProgress(func(step, total int, item string) {
+				pct := 5
+				if total > 0 {
+					pct = 5 + (step * 25 / total)
+				}
+				progressChan <- wizardProgressMsg{
+					StepID:      step,
+					TotalSteps:  total,
+					Phase:       "Purging (Destroyer)",
+					Action:      "purge",
+					ResourceID:  item,
+					Description: "Purging " + item,
+					Percent:     pct,
+				}
+			})
+			destroyerSvc.SetOnLog(func(item, line string) {
+				progressChan <- wizardProgressMsg{
+					Phase:      "Purging (Destroyer)",
+					Action:     "purge",
+					ResourceID: item,
+					OutputLine: line,
+				}
+			})
+			pctx := security.ContextWithOutputHandler(ctx, func(line string) {
+				progressChan <- wizardProgressMsg{
+					Phase:      "Purging (Destroyer)",
+					Action:     "purge",
+					OutputLine: line,
+				}
+			})
+			if _, purgeErr := destroyerSvc.ExecutePurge(pctx, purgePlan, false, false); purgeErr != nil {
+				progressChan <- wizardProgressMsg{
+					Phase:      "Purging (Destroyer)",
+					Action:     "purge",
+					ResourceID: "destroyer",
+					OutputLine: "Purge warning: " + purgeErr.Error(),
+				}
+			}
+		}
+	}
+
+	// 3. Install Phase
+	activePlan := plan
+	var installErr error
+	if destroyerMode && installSvc != nil {
+		progressChan <- wizardProgressMsg{
+			StepID:      0,
+			TotalSteps:  1,
+			Phase:       "Planning Reinstall",
+			Action:      "plan",
+			ResourceID:  "packages",
+			Description: "Generating fresh install plan for selected packages...",
+			Percent:     32,
+		}
+		targetList := selectedList
+		targetProf := ""
+		if len(targetList) == 0 {
+			targetProf = profName
+		}
+		freshPlan, planErr := installSvc.PlanWithReinstall(ctx, targetProf, targetList, true)
+		if planErr != nil {
+			installErr = errors.Join(installErr, fmt.Errorf("planning destroyer reinstall: %w", planErr))
+			activePlan = nil
+		} else if freshPlan != nil {
+			activePlan = freshPlan
+		}
+	}
+
+	if installSvc != nil && activePlan != nil && len(activePlan.Steps) > 0 {
+		totalInstallSteps := len(activePlan.Steps)
+		var completedSteps atomic.Int32
+		installSvc.SetOnProgress(func(ev app.ProgressEvent) {
+			if ev.Status == domain.StepSuccess || ev.Status == domain.StepFailed {
+				completedSteps.Add(1)
+			}
+			done := int(completedSteps.Load())
+			pct := 35
+			if totalInstallSteps > 0 {
+				pct = 35 + (done * 45 / totalInstallSteps)
+			}
+			progressChan <- wizardProgressMsg{
+				StepID:      ev.StepID,
+				TotalSteps:  totalInstallSteps,
+				Phase:       "Installing",
+				Action:      string(ev.Action),
+				ResourceID:  ev.ResourceID,
+				Description: ev.Description,
+				Status:      ev.Status,
+				Percent:     pct,
+				OutputLine:  ev.OutputLine,
+			}
+		})
+		if err := installSvc.Apply(ctx, activePlan); err != nil {
+			installErr = err
+		}
+	}
+
+	// 4. Hacks Phase
+	var hacksErr error
+	if hacksSvc != nil && includeHacks && len(matchedHacks) > 0 {
+		totalHacks := len(matchedHacks)
+		for i, hk := range matchedHacks {
+			pct := 80
+			if totalHacks > 0 {
+				pct = 80 + ((i + 1) * 10 / totalHacks)
+			}
+			progressChan <- wizardProgressMsg{
+				StepID:      i + 1,
+				TotalSteps:  totalHacks,
+				Phase:       "Hardware Hacks",
+				Action:      "apply",
+				ResourceID:  hk.ID,
+				Description: hk.Description,
+				Percent:     pct,
+			}
+			hackCtx := security.ContextWithOutputHandler(ctx, func(line string) {
+				progressChan <- wizardProgressMsg{
+					StepID:      i + 1,
+					TotalSteps:  totalHacks,
+					Phase:       "Hardware Hacks",
+					Action:      "apply",
+					ResourceID:  hk.ID,
+					Description: hk.Description,
+					Status:      domain.StepRunning,
+					Percent:     pct,
+					OutputLine:  line,
+				}
+			})
+			if _, err := hacksSvc.Apply(hackCtx, hk.ID); err != nil {
+				hacksErr = errors.Join(hacksErr, err)
+			}
+		}
+	}
+
+	// 5. Sync Phase (Dotfiles first, then OS Configuration strictly at the end)
+	var syncErr error
+	var osConfigStatus string
+	var osConfigErr error
+	if syncSvc != nil {
+		progressChan <- wizardProgressMsg{
+			StepID:      90001,
+			TotalSteps:  1,
+			Phase:       "Dotfile Sync",
+			Action:      "merge",
+			ResourceID:  "dotfiles",
+			Description: "Reconciling dotfiles with 3-way merge...",
+			Status:      domain.StepRunning,
+			Percent:     92,
+		}
+		dotfilesOpts := app.SyncOptions{
+			Force:         destroyerMode,
+			Shell:         selectedShell,
+			Terminal:      selectedTerminal,
+			ExcludeGroups: []string{"osconfig"},
+		}
+		if _, err := syncSvc.Sync(ctx, dotfilesOpts); err != nil {
+			syncErr = errors.Join(syncErr, err)
+			progressChan <- wizardProgressMsg{
+				StepID:      90001,
+				TotalSteps:  1,
+				Phase:       "Dotfile Sync",
+				Action:      "merge",
+				ResourceID:  "dotfiles",
+				Description: "Dotfile synchronization failed",
+				Status:      domain.StepFailed,
+				Percent:     95,
+				OutputLine:  err.Error(),
+			}
+		} else {
+			progressChan <- wizardProgressMsg{
+				StepID:      90001,
+				TotalSteps:  1,
+				Phase:       "Dotfile Sync",
+				Action:      "merge",
+				ResourceID:  "dotfiles",
+				Description: "Dotfiles synchronized",
+				Status:      domain.StepSuccess,
+				Percent:     95,
+			}
+		}
+
+		if includeOSConfig && ctx.Err() == nil {
+			progressChan <- wizardProgressMsg{
+				StepID:      90002,
+				TotalSteps:  1,
+				Phase:       "OS Configuration",
+				Action:      "osconfig",
+				ResourceID:  "osconfig",
+				Description: "Applying OS integration & system configuration...",
+				Status:      domain.StepRunning,
+				Percent:     97,
+			}
+			osCtx := security.ContextWithOutputHandler(ctx, func(line string) {
+				progressChan <- wizardProgressMsg{
+					StepID:      90002,
+					TotalSteps:  1,
+					Phase:       "OS Configuration",
+					Action:      "osconfig",
+					ResourceID:  "osconfig",
+					Description: "Applying OS configuration...",
+					Status:      domain.StepRunning,
+					Percent:     98,
+					OutputLine:  line,
+				}
+			})
+			osOpts := app.SyncOptions{
+				Group:    "osconfig",
+				Force:    destroyerMode,
+				Shell:    selectedShell,
+				Terminal: selectedTerminal,
+			}
+			osResults, err := syncSvc.Sync(osCtx, osOpts)
+			for _, r := range osResults {
+				if r.ConfigID == "macos-osconfig-script" && r.Detail != "" {
+					osConfigStatus = r.Detail
+				}
+			}
+			if err != nil {
+				osConfigErr = err
+				if osConfigStatus == "" {
+					osConfigStatus = "Failed: " + err.Error()
+				}
+				syncErr = errors.Join(syncErr, err)
+				progressChan <- wizardProgressMsg{
+					StepID:      90002,
+					TotalSteps:  1,
+					Phase:       "OS Configuration",
+					Action:      "osconfig",
+					ResourceID:  "osconfig",
+					Description: "OS configuration failed",
+					Status:      domain.StepFailed,
+					Percent:     99,
+					OutputLine:  err.Error(),
+				}
+			} else {
+				if osConfigStatus == "" {
+					if len(osResults) > 0 {
+						osConfigStatus = "Applied successfully"
+					} else {
+						osConfigStatus = "Applied (no OS-specific entries)"
+					}
+				}
+				progressChan <- wizardProgressMsg{
+					StepID:      90002,
+					TotalSteps:  1,
+					Phase:       "OS Configuration",
+					Action:      "osconfig",
+					ResourceID:  "osconfig",
+					Description: "OS configuration applied",
+					Status:      domain.StepSuccess,
+					Percent:     99,
+					OutputLine:  osConfigStatus,
+				}
+			}
+		} else if !includeOSConfig {
+			osConfigStatus = "Excluded by user"
+		}
+	}
+
+	finalErr := errors.Join(installErr, hacksErr, syncErr)
+	completeDesc := "All components reconciled successfully."
+	if finalErr != nil {
+		completeDesc = "Completed with component errors (review summary)."
+	}
+	progressChan <- wizardProgressMsg{
+		StepID:      1,
+		TotalSteps:  1,
+		Phase:       "Complete",
+		Action:      "done",
+		ResourceID:  "complete",
+		Description: completeDesc,
+		Percent:     100,
+	}
+
+	if finalErr == nil && store != nil && profName != "" {
+		_ = store.SetActiveProfile(profName)
+	}
+
+	progressChan <- wizardApplyDoneMsg{
+		err:            finalErr,
+		logPath:        logPath,
+		osConfigStatus: osConfigStatus,
+		osConfigErr:    osConfigErr,
+	}
+}
+
+// View renders the current stage of the interactive wizard (Bubble Tea v2).
+func (w WizardModel) View() tea.View {
+	if w.quitting {
+		return tea.NewView("")
+	}
+
+	header := w.styles.Header.Render("  ANX SETUP WIZARD  ") + w.styles.Muted.Render(" — Interactive Component Interview")
+	availWidth := w.width
+	if availWidth < 50 {
+		availWidth = 50
+	}
+	availHeight := w.height - 4
+	if availHeight < 6 {
+		availHeight = 6
+	}
+
+	var body string
+	switch w.stage {
+	case StageSelectProfile:
+		body = w.renderSelectProfile(availWidth)
+	case StageSelectEnvironment:
+		body = w.renderSelectEnvironment(availWidth)
+	case StageSelectPackages:
+		body = w.renderSelectPackages(availWidth, availHeight)
+	case StagePlanning:
+		body = w.renderPlanning(availWidth)
+	case StageReviewPlan:
+		body = w.renderReviewPlan(availWidth, availHeight)
+	case StageApplying:
+		body = w.renderApplying(availWidth, availHeight)
+	case StageCompleted:
+		body = w.renderCompleted(availWidth, availHeight)
+	}
+
+	content := fmt.Sprintf("%s\n\n%s", header, body)
+	v := tea.NewView(content)
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
+	return v
+}
+
+func (w WizardModel) renderSelectProfile(width int) string {
+	lines := []string{
+		w.styles.Highlight.Render("STAGE 1/5: SELECT INSTALLATION PROFILE"),
+		"Choose a preset profile matching your machine's primary role:",
+	}
+	if len(w.matchedHacks) > 0 {
+		hackNames := make([]string, 0, len(w.matchedHacks))
+		for _, hk := range w.matchedHacks {
+			hackNames = append(hackNames, hk.ID)
+		}
+		status := w.styles.Muted.Render("[press 'h' to toggle]")
+		if w.includeHacks {
+			status = w.styles.Success.Render("[included ✓]")
+		}
+		lines = append(lines, w.styles.Warning.Render(fmt.Sprintf("⚡ Hardware match: %s %s", strings.Join(hackNames, ", "), status)))
+	}
+	lines = append(lines, "")
+
+	for i, prof := range w.profiles {
+		cursor := "  "
+		if i == w.selectedProf {
+			cursor = "> "
+		}
+		item := fmt.Sprintf("%s%-15s : %s", cursor, prof.Name, prof.Description)
+		if i == w.selectedProf {
+			lines = append(lines, w.styles.RenderSelectedRow(AnsiTruncate(item, width-4)))
+		} else {
+			lines = append(lines, AnsiTruncate(item, width-4))
+		}
+	}
+
+	lines = append(lines, "", w.styles.Muted.Render("Navigation: [Up/Down / j/k] Select  [Enter] Confirm Profile  [h] Toggle Hacks  [Esc / q] Quit"))
+	return strings.Join(lines, "\n")
+}
+
+func (w WizardModel) renderSelectEnvironment(width int) string {
+	lines := []string{
+		w.styles.Highlight.Render("STAGE 2/5: CONFIGURE SHELL & TERMINAL ENVIRONMENT"),
+		"Select your primary shell and terminal. Zsh is the canonical source of truth; adapters are provided for Bash, Fish, and Nushell.",
+	}
+
+	if w.platform != nil {
+		hostInfo := fmt.Sprintf("System: %s/%s | Detected Shell: %s | Detected Terminal: %s",
+			w.platform.OS(), w.platform.DesktopEnv(), w.platform.CurrentShell(), w.platform.CurrentTerminal())
+		lines = append(lines, w.styles.Muted.Render(hostInfo))
+	}
+	lines = append(lines, "")
+
+	// 1. Shell Section
+	shellHeader := "  SHELL SELECTION"
+	if w.envFocus == "shell" {
+		shellHeader = w.styles.Highlight.Render("▶ SHELL SELECTION [Active Focus]")
+	} else {
+		shellHeader = w.styles.Muted.Render("  SHELL SELECTION (Press [Tab] to focus)")
+	}
+	lines = append(lines, shellHeader)
+
+	for i, sh := range w.shells {
+		cursor := "  "
+		if w.envFocus == "shell" && i == w.shellCursor {
+			cursor = "> "
+		}
+		radio := "( )"
+		if sh.ID == w.selectedShell {
+			radio = w.styles.Success.Render("(•)")
+		}
+		badge := w.styles.Muted.Render(sh.Badge)
+		if strings.Contains(sh.Badge, "Recommended") {
+			badge = w.styles.Success.Render(sh.Badge)
+		}
+		row := fmt.Sprintf("%s%s %-8s %-18s : %s", cursor, radio, sh.Name, badge, sh.Description)
+		if w.envFocus == "shell" && i == w.shellCursor {
+			lines = append(lines, w.styles.RenderSelectedRow(AnsiTruncate(row, width-4)))
+		} else {
+			lines = append(lines, AnsiTruncate(row, width-4))
+		}
+	}
+
+	lines = append(lines, "")
+
+	// 2. Terminal Section
+	termHeader := "  TERMINAL SELECTION"
+	if w.envFocus == "terminal" {
+		termHeader = w.styles.Highlight.Render("▶ TERMINAL SELECTION [Active Focus]")
+	} else {
+		termHeader = w.styles.Muted.Render("  TERMINAL SELECTION (Press [Tab] to focus)")
+	}
+	lines = append(lines, termHeader)
+
+	for i, term := range w.terminals {
+		cursor := "  "
+		if w.envFocus == "terminal" && i == w.terminalCursor {
+			cursor = "> "
+		}
+		radio := "( )"
+		if term.ID == w.selectedTerminal {
+			radio = w.styles.Success.Render("(•)")
+		}
+		badge := w.styles.Muted.Render(term.Badge)
+		if strings.Contains(term.Badge, "Recommended") {
+			badge = w.styles.Success.Render(term.Badge)
+		} else if strings.Contains(term.Badge, "Partial") || strings.Contains(term.Badge, "Limited") {
+			badge = w.styles.Warning.Render(term.Badge)
+		}
+		row := fmt.Sprintf("%s%s %-18s %-16s : %s", cursor, radio, term.Name, badge, term.Description)
+		if w.envFocus == "terminal" && i == w.terminalCursor {
+			lines = append(lines, w.styles.RenderSelectedRow(AnsiTruncate(row, width-4)))
+		} else {
+			lines = append(lines, AnsiTruncate(row, width-4))
+		}
+	}
+
+	// Warning notices for limited or partial terminals
+	for _, term := range w.terminals {
+		if term.ID == w.selectedTerminal && term.Warning != "" {
+			lines = append(lines, "", w.styles.Warning.Render(fmt.Sprintf("⚠️  NOTICE for %s: %s", term.Name, term.Warning)))
+			break
+		}
+	}
+
+	lines = append(lines, "", w.styles.Muted.Render("Navigation: [Tab / Left / Right] Switch Focus  [Up/Down / j/k] Navigate  [Space] Select  [Enter] Confirm & Next  [Esc] Back  [q] Quit"))
+	return strings.Join(lines, "\n")
+}
+
+func (w WizardModel) renderSelectPackages(width, height int) string {
+	headerLines := []string{
+		w.styles.Highlight.Render(fmt.Sprintf("STAGE 3/5: CUSTOMIZE TOOLS & PACKAGES (%d/%d)", w.pkgCursor+1, len(w.packages))),
+		"Toggle components (marking a tool auto-selects its dependencies; unmarking a dependency deselects dependent tools):",
+		"",
+	}
+
+	availHeight := w.visiblePkgLines()
+
+	pkgScrollOffset := AdjustScrollOffset(w.pkgCursor, w.pkgScrollOffset, availHeight, len(w.packages))
+	start := pkgScrollOffset
+	end := start + availHeight
+	if end > len(w.packages) {
+		end = len(w.packages)
+	}
+
+	lines := make([]string, 0, len(headerLines)+availHeight+4)
+	lines = append(lines, headerLines...)
+
+	if start > 0 {
+		lines = append(lines, w.styles.Muted.Render(fmt.Sprintf("  ▲ ... (%d more packages above)", start)))
+	}
+
+	for i := start; i < end; i++ {
+		p := w.packages[i]
+		cursor := "  "
+		if i == w.pkgCursor {
+			cursor = "> "
+		}
+		check := "[ ]"
+		if w.selectedPkgs[p.ID] {
+			check = w.styles.Success.Render("[✓]")
+		}
+		depBadge := ""
+		if p.Deprecated {
+			depBadge = " " + w.styles.Warning.Render("[Deprecated]")
+		}
+
+		isDirect := p.IsDirectTool(w.requiredBy)
+		typeTag := w.styles.Highlight.Render("[Tool]")
+		depDetail := ""
+		if !isDirect {
+			typeTag = w.styles.Muted.Render("[Dep]")
+			if len(w.requiredBy[p.ID]) > 0 {
+				depDetail = fmt.Sprintf(" (dep of: %s)", strings.Join(w.requiredBy[p.ID], ", "))
+			} else if strings.Contains(p.Category, "build") || p.ID == "build-essential" || p.ID == "cmake" || p.ID == "pkg-config" {
+				depDetail = " (build dependency)"
+			} else if strings.Contains(p.Category, "lib") || strings.HasSuffix(p.ID, "-dev") {
+				depDetail = " (library dependency)"
+			} else {
+				depDetail = " (system prerequisite)"
+			}
+		} else if len(p.DependsOn) > 0 {
+			depDetail = fmt.Sprintf(" (requires: %s)", strings.Join(p.DependsOn, ", "))
+		}
+
+		row := fmt.Sprintf("%s%s %s %-14s %-10s%s : %s%s", cursor, check, typeTag, p.ID, p.Category, depBadge, p.Description, depDetail)
+		if i == w.pkgCursor {
+			lines = append(lines, w.styles.RenderSelectedRow(AnsiTruncate(row, width-4)))
+		} else {
+			lines = append(lines, AnsiTruncate(row, width-4))
+		}
+	}
+
+	if end < len(w.packages) {
+		lines = append(lines, w.styles.Muted.Render(fmt.Sprintf("  ▼ ... (%d more packages below)", len(w.packages)-end)))
+	}
+
+	// Sticky toggle line above navigation footer
+	if len(w.matchedHacks) > 0 {
+		status := w.styles.Muted.Render("[Excluded] (press [h] to include)")
+		if w.includeHacks {
+			status = w.styles.Success.Render(fmt.Sprintf("[Included ✓ (%d hacks)] (press [h] to exclude)", len(w.matchedHacks)))
+		}
+		lines = append(lines, fmt.Sprintf("⚡ Hardware Hacks (Sticky): %s", status))
+	}
+
+	lines = append(lines, w.styles.Muted.Render("Navigation: [Up/Down / j/k] Navigate  [Space] Toggle  [h] Toggle Hacks  [Enter] Review Plan  [Esc] Back  [q] Quit"))
+	return strings.Join(lines, "\n")
+}
+
+func (w WizardModel) renderReviewPlan(width, height int) string {
+	planID := "preview"
+	stepCount := 0
+	if w.plan != nil {
+		planID = w.plan.ID
+		stepCount = len(w.plan.Steps)
+	}
+
+	hacksBadge := w.styles.Muted.Render("[No Hacks Detected]")
+	if len(w.matchedHacks) > 0 {
+		if w.includeHacks {
+			hacksBadge = w.styles.Success.Render(fmt.Sprintf("[Included ✓ (%d)]", len(w.matchedHacks)))
+		} else {
+			hacksBadge = w.styles.Muted.Render("[Excluded]")
+		}
+	}
+
+	osconfigBadge := w.styles.Muted.Render("[Excluded]")
+	if w.includeOSConfig {
+		osconfigBadge = w.styles.Success.Render("[Included ✓]")
+	}
+
+	destroyerBadge := w.styles.Muted.Render("[OFF]")
+	if w.destroyerMode {
+		destroyerBadge = w.styles.Error.Render("[ACTIVE ⚠️]")
+	}
+
+	headerLine := w.styles.Highlight.Render("STAGE 4/5: REVIEW EXECUTION PLAN") +
+		w.styles.Muted.Render(fmt.Sprintf(" | Plan ID: %s | Total Actions: %d", planID, stepCount))
+
+	stickyBarText := fmt.Sprintf(" ⚙️  TOGGLES (STICKY): [h] Hacks: %s  |  [o] OS Config: %s  |  [d] Destroyer: %s",
+		hacksBadge, osconfigBadge, destroyerBadge)
+	stickyBarBox := w.styles.BorderActive.Render(stickyBarText)
+
+	stickyTopLines := []string{
+		headerLine,
+		stickyBarBox,
+	}
+
+	var scrollableLines []string
+	scrollableLines = append(scrollableLines,
+		w.styles.Muted.Render("• Automatic pre-mutation backups will be created before touching any file."),
+		w.styles.Muted.Render("• Transaction journal will record each step for rollback safety."),
+		"",
+		w.styles.Highlight.Render("TARGET ENVIRONMENT:"),
+		fmt.Sprintf("  • Primary Shell : %s (Zsh source of truth)", w.selectedShell),
+	)
+
+	termWarning := ""
+	for _, t := range w.terminals {
+		if t.ID == w.selectedTerminal && t.Warning != "" {
+			termWarning = fmt.Sprintf(" (%s)", w.styles.Warning.Render(t.Warning))
+			break
+		}
+	}
+	scrollableLines = append(scrollableLines, fmt.Sprintf("  • Terminal      : %s%s", w.selectedTerminal, termWarning))
+
+	scrollableLines = append(scrollableLines, "", w.styles.Highlight.Render("CRYPTOGRAPHIC ORIGIN & PROVENANCE SEAL:"))
+	origin := "Embedded Catalog (Immutable Binary)"
+	shortDigest := "N/A"
+	manifestFP := "N/A"
+	dotfilesFP := "N/A"
+	statusBadge := w.styles.Success.Render("[VERIFIED ✓]")
+	if w.seal != nil {
+		origin = w.seal.ProvenanceOrigin()
+		shortDigest = w.seal.ShortDigest()
+		manifestFP = w.seal.ShortManifestDigest()
+		dotfilesFP = w.seal.ShortDotfilesDigest()
+		if w.seal.InsecureOrigin {
+			statusBadge = w.styles.Warning.Render(fmt.Sprintf("[INSECURE ORIGIN: %s]", w.seal.InsecureReason))
+		}
+	}
+	scrollableLines = append(scrollableLines, fmt.Sprintf("  • Source Origin   : %s", origin))
+	scrollableLines = append(scrollableLines, fmt.Sprintf("  • Manifests SHA256: %s", manifestFP))
+	if w.platform != nil {
+		scrollableLines = append(scrollableLines, fmt.Sprintf("  • Destination Home: %s", w.platform.HomeDir()))
+	}
+	scrollableLines = append(scrollableLines, fmt.Sprintf("  • Dotfiles SHA256 : %s", dotfilesFP))
+	scrollableLines = append(scrollableLines, fmt.Sprintf("  • Security Seal   : %s %s", shortDigest, statusBadge))
+
+	if len(w.matchedHacks) > 0 {
+		scrollableLines = append(scrollableLines, "", w.styles.Highlight.Render(fmt.Sprintf("⚡ HARDWARE WORKSTATION HACKS %s (Press [h] to toggle):", hacksBadge)))
+		for _, hk := range w.matchedHacks {
+			scrollableLines = append(scrollableLines, fmt.Sprintf("  • %-20s : %s", hk.ID, hk.Description))
+		}
+	}
+
+	scrollableLines = append(scrollableLines, "", w.styles.Highlight.Render(fmt.Sprintf("🖥️  DESKTOP & OS INTEGRATION (osconfig) %s (Press [o] to toggle):", osconfigBadge)))
+	if w.platform != nil && w.platform.OS() == "darwin" {
+		scrollableLines = append(scrollableLines, "  • Amethyst          : macOS tiling window manager config (~/.amethyst.yml)")
+		scrollableLines = append(scrollableLines, "  • macos-osconfig    : System defaults (max macOS 27), Touch ID sudo_local & Shortcuts")
+		scrollableLines = append(scrollableLines, "  • TCC / Full Disk   : Optional (Safari/Accessibility TCC keys auto-skip if FDA is not enabled)")
+	} else {
+		scrollableLines = append(scrollableLines, "  • rcmd switcher     : Right-Alt fast window focus & daemon integration")
+		scrollableLines = append(scrollableLines, "  • GNOME Extension   : rcmd-shell@arturonavax.dev IPC bridge for Wayland")
+		scrollableLines = append(scrollableLines, "  • Desktop Shortcuts : Preserved host-specific window switcher keybindings")
+	}
+
+	var drifted []app.ConfigDiff
+	for _, d := range w.configDiffs {
+		if d.State != "synced" {
+			drifted = append(drifted, d)
+		}
+	}
+	if len(drifted) > 0 {
+		scrollableLines = append(scrollableLines, "", w.styles.Warning.Render(fmt.Sprintf("⚠️  DOTFILE DRIFTS DETECTED (%d configs with differences):", len(drifted))))
+		for _, d := range drifted {
+			sum := d.Summary
+			if sum == "" {
+				sum = d.State
+			}
+			scrollableLines = append(scrollableLines, fmt.Sprintf("  • %-22s [%s] (%s)", d.ConfigID, d.State, sum))
+		}
+		scrollableLines = append(scrollableLines, w.styles.Muted.Render("  Dotfiles will be automatically synchronized via safe 3-way merge."))
+	}
+
+	scrollableLines = append(scrollableLines, "", w.styles.Highlight.Render("PLANNED ACTIONS:"))
+	if w.plan != nil {
+		for _, s := range w.plan.Steps {
+			scrollableLines = append(scrollableLines, fmt.Sprintf("  • [%s] %s", s.Action, AnsiTruncate(s.Description, width-15)))
+		}
+	} else {
+		scrollableLines = append(scrollableLines, "  • [noop] Ready to apply selected configuration")
+	}
+
+	destroyerNotice := "OFF — safe non-destructive update"
+	if w.destroyerMode {
+		destroyerNotice = w.styles.Error.Render("ACTIVE ⚠️  Purges packages, tools & configs before installing")
+	}
+	scrollableLines = append(scrollableLines, "", fmt.Sprintf("💣 DESTROYER REINSTALL: %s (Press [d] to toggle)", destroyerNotice))
+
+	if w.sudoErr != nil {
+		scrollableLines = append(scrollableLines, "", w.styles.Error.Render(fmt.Sprintf("❌ SUDO AUTHENTICATION FAILED: %v (Press [Enter] to retry authentication)", w.sudoErr)))
+	} else if w.needsSudo() {
+		scrollableLines = append(scrollableLines, "", w.styles.Warning.Render("🔒 Administrator privileges (sudo) required. You will be prompted in the terminal upon confirmation."))
+	}
+
+	var wrappedLines []string
+	for _, l := range scrollableLines {
+		wrappedLines = append(wrappedLines, AnsiWrap(l, width-4)...)
+	}
+	scrollableLines = wrappedLines
+
+	stickyTopCount := len(stickyTopLines)
+	stickyBottomCount := 1
+
+	availViewportHeight := height - stickyTopCount - stickyBottomCount - 1
+	if availViewportHeight < 4 {
+		availViewportHeight = 4
+	}
+
+	totalLines := len(scrollableLines)
+	maxOffset := totalLines - availViewportHeight
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	offset := w.planScrollOffset
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	end := offset + availViewportHeight
+	if end > totalLines {
+		end = totalLines
+	}
+
+	visibleViewport := scrollableLines[offset:end]
+
+	var footer string
+	if w.sudoErr != nil {
+		footer = w.styles.Error.Render("Sudo authentication failed. Press [Enter] to retry password entry, [Esc] Back, or [q] Cancel.")
+	} else if totalLines > availViewportHeight {
+		footer = w.styles.Muted.Render(fmt.Sprintf("Navigation: [j/k / Scroll] Details (%d-%d/%d)  [h] Hacks  [o] OS Config  [d] Destroyer  [Enter] Execute  [Esc] Back", offset+1, end, totalLines))
+	} else {
+		footer = w.styles.Success.Render("Press [Enter] to Execute Plan, [h] Hacks, [o] OS Config, [d] Destroyer, [Esc] Back, or [q] to Cancel.")
+	}
+
+	resultLines := make([]string, 0, stickyTopCount+len(visibleViewport)+2)
+	resultLines = append(resultLines, stickyTopLines...)
+	resultLines = append(resultLines, visibleViewport...)
+	resultLines = append(resultLines, footer)
+
+	return strings.Join(resultLines, "\n")
+}
+
+func (w WizardModel) renderCompleted(width int, height ...int) string {
+	var lines []string
+	if w.err != nil {
+		lines = append(lines,
+			w.styles.Error.Render("⚠️  SETUP COMPLETED WITH COMPONENT WARNINGS / ERRORS"),
+			"",
+			w.styles.Muted.Render("The installer executed all independent tasks and reconciled components."),
+			w.styles.Muted.Render("The following summary outlines succeeded and failed items:"),
+			"",
+		)
+
+		if len(w.succeededItems) > 0 {
+			lines = append(lines, w.styles.Success.Render(fmt.Sprintf("✓ Succeeded (%d components):", len(w.succeededItems))))
+			succStr := strings.Join(w.succeededItems, ", ")
+			for _, wl := range AnsiWrap("   "+succStr, width-4) {
+				lines = append(lines, w.styles.Muted.Render(wl))
+			}
+			lines = append(lines, "")
+		}
+
+		if len(w.skippedItems) > 0 {
+			lines = append(lines, w.styles.Muted.Render(fmt.Sprintf("ℹ Skipped Dependents (%d): %s", len(w.skippedItems), strings.Join(w.skippedItems, ", "))), "")
+		}
+
+		if len(w.failedItems) > 0 {
+			lines = append(lines, w.styles.Error.Render(fmt.Sprintf("✖ Failed Components (%d):", len(w.failedItems))))
+			for _, item := range w.failedItems {
+				for _, wl := range AnsiWrap("   • "+item, width-4) {
+					lines = append(lines, w.styles.Error.Render(wl))
+				}
+			}
+			lines = append(lines, "")
+		}
+
+		if w.osConfigErr != nil {
+			lines = append(lines, w.styles.Error.Render("✖ OS Configuration (osconfig): "+w.osConfigErr.Error()), "")
+		} else if w.osConfigStatus != "" {
+			if strings.Contains(w.osConfigStatus, "warning") || strings.Contains(w.osConfigStatus, "skipped") {
+				lines = append(lines, w.styles.Warning.Render("⚠️  OS Configuration (osconfig): "+w.osConfigStatus), "")
+			} else {
+				lines = append(lines, w.styles.Success.Render("✓ OS Configuration (osconfig): "+w.osConfigStatus), "")
+			}
+		}
+
+		lines = append(lines, w.styles.Highlight.Render("Detailed Error Report:"))
+		for _, el := range strings.Split(w.err.Error(), "\n") {
+			for _, wl := range AnsiWrap("   "+el, width-4) {
+				lines = append(lines, w.styles.Muted.Render(wl))
+			}
+		}
+
+		lines = append(lines,
+			"",
+			w.styles.Highlight.Render("Next Steps:"),
+			"  • Core tools are functional with all succeeded packages.",
+			"  • Run 'anx doctor' to inspect environment health.",
+			"  • Re-run 'anx apply' to retry failed items when ready.",
+		)
+
+		if w.installLogPath != "" {
+			lines = append(lines,
+				"",
+				w.styles.Highlight.Render("Persistent Installation Log:"),
+				fmt.Sprintf("  • Diagnostic log with complete command outputs: %s", w.installLogPath),
+			)
+		}
+
+		lines = append(lines,
+			"",
+			w.styles.Header.Render("Press [Enter] or [q] to exit."),
+		)
+	} else {
+		logLine := ""
+		if w.installLogPath != "" {
+			logLine = fmt.Sprintf("\n  • Installation log saved to: %s", w.installLogPath)
+		}
+
+		lines = append(lines,
+			w.styles.Success.Render("✓ SETUP AND RECONCILIATION COMPLETED SUCCESSFULLY"),
+			"",
+			"All selected packages and configurations were reconciled safely.",
+		)
+		if len(w.succeededItems) > 0 {
+			lines = append(lines, "", w.styles.Success.Render(fmt.Sprintf("✓ Reconciled (%d components):", len(w.succeededItems))))
+			for _, wl := range AnsiWrap("   "+strings.Join(w.succeededItems, ", "), width-4) {
+				lines = append(lines, w.styles.Muted.Render(wl))
+			}
+		}
+		if w.osConfigStatus != "" {
+			lines = append(lines, "")
+			if strings.Contains(w.osConfigStatus, "warning") || strings.Contains(w.osConfigStatus, "skipped") {
+				lines = append(lines, w.styles.Warning.Render("⚠️  OS Configuration (osconfig): "+w.osConfigStatus))
+			} else {
+				lines = append(lines, w.styles.Success.Render("✓ OS Configuration (osconfig): "+w.osConfigStatus))
+			}
+		}
+		lines = append(lines,
+			"",
+			w.styles.Highlight.Render("Next Steps:"),
+			"  • Restart your terminal or run 'zsh' to load new configs.",
+			"  • Run 'anx doctor' anytime to verify your environment health."+logLine,
+			"",
+			w.styles.Header.Render("Press [Enter] or [q] to exit."),
+		)
+	}
+
+	var allLines []string
+	for _, l := range lines {
+		allLines = append(allLines, AnsiWrap(l, width-4)...)
+	}
+
+	availHeight := 0
+	if len(height) > 0 {
+		availHeight = height[0] - 3
+	}
+	if availHeight <= 0 || len(allLines) <= availHeight {
+		return strings.Join(allLines, "\n")
+	}
+
+	totalLines := len(allLines)
+	maxOffset := totalLines - availHeight
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	offset := w.completedScrollOffset
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	end := offset + availHeight
+	if end > totalLines {
+		end = totalLines
+	}
+	visibleLines := allLines[offset:end]
+
+	scrollHint := w.styles.Muted.Render(fmt.Sprintf("Navigation: [j/k / Up/Down / Mouse Wheel] Scroll Results (%d-%d/%d)  [Enter/q] Exit", offset+1, end, totalLines))
+	return strings.Join(append(visibleLines, "", scrollHint), "\n")
+}
+
+func (w WizardModel) renderPlanning(width int) string {
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	frame := frames[w.spinnerFrame%len(frames)]
+	spinner := w.styles.Header.Render(frame)
+	title := w.styles.Highlight.Render("Resolving dependency graph and building execution plan...")
+
+	lines := []string{
+		fmt.Sprintf("  %s  %s", spinner, title),
+		"",
+		w.styles.Muted.Render("  • Solving package dependencies and provider execution order..."),
+		w.styles.Muted.Render("  • Inspecting dotfile diffs and drift states across repositories..."),
+		w.styles.Muted.Render("  • Please wait, calculating optimal deterministic plan..."),
+		"",
+		w.styles.Muted.Render("  Navigation: [Esc] Return to Packages"),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (w WizardModel) renderProgressBar(percent, barWidth int) string {
+	if barWidth < 10 {
+		barWidth = 10
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	filled := (percent * barWidth) / 100
+	empty := barWidth - filled
+
+	barFilled := strings.Repeat("█", filled)
+	barEmpty := strings.Repeat("░", empty)
+
+	return fmt.Sprintf("[%s%s] %3d%%", w.styles.Header.Render(barFilled), w.styles.Muted.Render(barEmpty), percent)
+}
+
+func (w WizardModel) renderWorkerPulseBar(frame, barWidth int) string {
+	if barWidth < 8 {
+		barWidth = 8
+	}
+	period := barWidth * 2
+	pos := frame % period
+	if pos >= barWidth {
+		pos = period - 1 - pos
+	}
+	var b strings.Builder
+	b.WriteString("[")
+	for i := 0; i < barWidth; i++ {
+		dist := i - pos
+		if dist < 0 {
+			dist = -dist
+		}
+		if dist <= 1 {
+			b.WriteString(w.styles.Header.Render("█"))
+		} else {
+			b.WriteString(w.styles.Muted.Render("░"))
+		}
+	}
+	b.WriteString("]")
+	return b.String()
+}
+
+func (w WizardModel) renderWorkerIndividualBar(slot activeWorkerSlot, frame, barWidth int) string {
+	if barWidth < 10 {
+		barWidth = 10
+	}
+	elapsed := time.Since(slot.StartedAt)
+	if elapsed < 0 || slot.StartedAt.IsZero() {
+		elapsed = 0
+	}
+	period := barWidth * 2
+	pos := frame % period
+	if pos >= barWidth {
+		pos = period - 1 - pos
+	}
+	var b strings.Builder
+	b.WriteString("[")
+	for i := 0; i < barWidth; i++ {
+		dist := i - pos
+		if dist < 0 {
+			dist = -dist
+		}
+		if dist <= 1 {
+			b.WriteString(w.styles.Header.Render("█"))
+		} else {
+			b.WriteString(w.styles.Muted.Render("░"))
+		}
+	}
+	b.WriteString("]")
+	return fmt.Sprintf("%s %s", b.String(), w.styles.Muted.Render(fmt.Sprintf("%4.1fs", elapsed.Seconds())))
+}
+
+func (w WizardModel) renderWorkerOutputBox(slot activeWorkerSlot, width int) []string {
+	boxWidth := width - 6
+	if boxWidth < 30 {
+		boxWidth = 30
+	}
+	innerBoxWidth := boxWidth - 4
+	if innerBoxWidth < 20 {
+		innerBoxWidth = 20
+	}
+
+	header := fmt.Sprintf("┌─ [%s] output ─", slot.ResourceID)
+	if len(header) < boxWidth {
+		header += strings.Repeat("─", boxWidth-len(header)-1) + "┐"
+	} else {
+		header = header[:boxWidth-1] + "┐"
+	}
+
+	var boxLines []string
+	boxLines = append(boxLines, "   "+w.styles.Muted.Render(header))
+
+	outputs := slot.Outputs
+	if len(outputs) == 0 {
+		outputs = []string{"Preparing operation..."}
+	}
+	start := 0
+	if len(outputs) > 3 {
+		start = len(outputs) - 3
+	}
+	for _, rawLine := range outputs[start:] {
+		wrapped := AnsiWrap(rawLine, innerBoxWidth-2)
+		for _, wl := range wrapped {
+			pad := innerBoxWidth - ansi.StringWidth(wl)
+			if pad < 0 {
+				pad = 0
+			}
+			lineContent := fmt.Sprintf("│ > %s%s │", wl, strings.Repeat(" ", pad))
+			boxLines = append(boxLines, "   "+w.styles.Muted.Render(lineContent))
+		}
+	}
+
+	footer := "└" + strings.Repeat("─", boxWidth-2) + "┘"
+	boxLines = append(boxLines, "   "+w.styles.Muted.Render(footer))
+	return boxLines
+}
+
+func (w WizardModel) renderGlobalOutputBox(width int) []string {
+	boxWidth := width - 4
+	if boxWidth < 30 {
+		boxWidth = 30
+	}
+	innerBoxWidth := boxWidth - 4
+	if innerBoxWidth < 20 {
+		innerBoxWidth = 20
+	}
+
+	header := "┌─ LIVE PROGRESS OUTPUT STREAM ─"
+	if len(header) < boxWidth {
+		header += strings.Repeat("─", boxWidth-len(header)-1) + "┐"
+	} else {
+		header = header[:boxWidth-1] + "┐"
+	}
+
+	var boxLines []string
+	boxLines = append(boxLines, "  "+w.styles.Header.Render(header))
+
+	recent := w.recentOutputLines
+	if len(recent) == 0 {
+		recent = []string{"Initializing deployment operations..."}
+	}
+	start := 0
+	if len(recent) > 6 {
+		start = len(recent) - 6
+	}
+	for _, rawLine := range recent[start:] {
+		wrapped := AnsiWrap(rawLine, innerBoxWidth-2)
+		for _, wl := range wrapped {
+			pad := innerBoxWidth - ansi.StringWidth(wl)
+			if pad < 0 {
+				pad = 0
+			}
+			lineContent := fmt.Sprintf("│ %s%s │", wl, strings.Repeat(" ", pad))
+			boxLines = append(boxLines, "  "+w.styles.Muted.Render(lineContent))
+		}
+	}
+
+	footer := "└" + strings.Repeat("─", boxWidth-2) + "┘"
+	boxLines = append(boxLines, "  "+w.styles.Header.Render(footer))
+	return boxLines
+}
+
+func (w WizardModel) renderApplying(width int, height ...int) string {
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	frame := frames[w.spinnerFrame%len(frames)]
+	spinner := w.styles.Header.Render(frame)
+
+	phase := w.progressPhase
+	if phase == "" {
+		phase = "Installing"
+	}
+
+	title := fmt.Sprintf("  %s %s: %s", spinner, w.styles.Header.Render("STAGE 5/5"), w.styles.Highlight.Render(phase))
+
+	barWidth := width - 24
+	if barWidth > 40 {
+		barWidth = 40
+	}
+	if barWidth < 15 {
+		barWidth = 15
+	}
+
+	stepInfo := ""
+	if w.progressTotal > 0 {
+		if w.completedSteps > 0 {
+			stepInfo = fmt.Sprintf(" (%d/%d steps completed)", w.completedSteps, w.progressTotal)
+		} else if w.progressStep > 0 {
+			stepInfo = fmt.Sprintf(" (Step %d/%d)", w.progressStep, w.progressTotal)
+		}
+	}
+
+	progressBar := w.renderProgressBar(w.progressPercent, barWidth) + w.styles.Muted.Render(stepInfo)
+
+	lines := []string{
+		title,
+		"",
+		fmt.Sprintf("  %s %s", w.styles.Header.Render("GLOBAL PROGRESS:"), progressBar),
+	}
+
+	if len(w.activeWorkers) > 0 {
+		lines = append(lines, "", fmt.Sprintf("  %s", w.styles.Header.Render(fmt.Sprintf("CONCURRENT WORKERS (%d executing in parallel):", len(w.activeWorkers)))))
+		maxWorkersToShow := 3
+		for i, id := range w.activeWorkerOrder {
+			if i >= maxWorkersToShow {
+				remaining := len(w.activeWorkerOrder) - maxWorkersToShow
+				lines = append(lines, fmt.Sprintf("   %s", w.styles.Muted.Render(fmt.Sprintf("... and %d more workers in flight", remaining))))
+				break
+			}
+			slot := w.activeWorkers[id]
+			wSpinner := frames[(w.spinnerFrame+id)%len(frames)]
+			act := strings.ToUpper(slot.Action)
+			if act == "" {
+				act = "INSTALL"
+			}
+			indivBar := w.renderWorkerIndividualBar(slot, w.spinnerFrame+id, 12)
+			lines = append(lines, fmt.Sprintf("   %s %s %s %s",
+				w.styles.Header.Render(wSpinner),
+				w.styles.Success.Render("["+act+"]"),
+				w.styles.Highlight.Render(slot.ResourceID),
+				indivBar,
+			))
+			// Render individual worker output widget
+			wBox := w.renderWorkerOutputBox(slot, width)
+			lines = append(lines, wBox...)
+		}
+	} else {
+		desc := w.progressDesc
+		if desc == "" {
+			desc = "Preparing operations..."
+		}
+		actionBadge := ""
+		if w.progressAction != "" {
+			actionBadge = fmt.Sprintf("[%s] ", strings.ToUpper(w.progressAction))
+		}
+		lines = append(lines, "", fmt.Sprintf("  %s%s", w.styles.Success.Render(actionBadge), desc))
+	}
+
+	// Always render the consolidated live output box
+	lines = append(lines, "")
+	lines = append(lines, w.renderGlobalOutputBox(width)...)
+
+	if len(w.recentCompleted) > 0 {
+		lines = append(lines, "", w.styles.Muted.Render("  RECENTLY COMPLETED:"))
+		for _, item := range w.recentCompleted {
+			lines = append(lines, fmt.Sprintf("   %s", w.styles.Success.Render(item)))
+		}
+	}
+
+	lines = append(lines, "",
+		w.styles.Muted.Render("  • Base tools prioritized first (curl, wget, build-essential, git, ghostty)."),
+		w.styles.Muted.Render("  • DAG scheduler executes independent downloads, builds, and syncs concurrently."),
+		w.styles.Muted.Render("  • Fault-tolerant: single package failures do not abort remaining installations."))
+
+	var allLines []string
+	for _, l := range lines {
+		allLines = append(allLines, AnsiWrap(l, width-4)...)
+	}
+
+	availHeight := 0
+	if len(height) > 0 {
+		availHeight = height[0] - 2
+	}
+	if availHeight <= 0 || len(allLines) <= availHeight {
+		return strings.Join(allLines, "\n")
+	}
+
+	totalLines := len(allLines)
+	maxOffset := totalLines - availHeight
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	offset := w.applyScrollOffset
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	end := offset + availHeight
+	if end > totalLines {
+		end = totalLines
+	}
+	visibleLines := allLines[offset:end]
+
+	scrollHint := w.styles.Muted.Render(fmt.Sprintf("  Navigation: [j/k / Up/Down / Mouse Wheel] Scroll Output (%d-%d/%d)", offset+1, end, totalLines))
+	return strings.Join(append(visibleLines, scrollHint), "\n")
+}
+
+// wizardProfileOrder lists profiles from most complete to most minimal; unknown profiles follow alphabetically.
+var wizardProfileOrder = []string{"full", "workstation", "ai-workstation", "developer", "terminal", "editor", "headless", "minimal"}
+
+func orderProfilesForWizard(profs []domain.Profile) []domain.Profile {
+	rank := make(map[string]int, len(wizardProfileOrder))
+	for i, n := range wizardProfileOrder {
+		rank[n] = i
+	}
+	out := append([]domain.Profile(nil), profs...)
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, iok := rank[out[i].Name]
+		rj, jok := rank[out[j].Name]
+		switch {
+		case iok && jok:
+			return ri < rj
+		case iok != jok:
+			return iok
+		default:
+			return out[i].Name < out[j].Name
+		}
+	})
+	return out
+}

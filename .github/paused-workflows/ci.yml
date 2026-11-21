@@ -1,0 +1,193 @@
+name: CI
+
+# Explicit runners avoid -latest migration. macos-26 runs on Apple Silicon arm64.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-latest]
+        go: ['1.27.3']
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Verify runner architecture
+        if: runner.os == 'macOS'
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(go env GOARCH)" = arm64
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit & integration tests (Unix)
+        if: runner.os != 'Windows'
+        run: go test -v -race -timeout 10m ./...
+
+      - name: Run unit & integration tests (Windows)
+        if: runner.os == 'Windows'
+        run: go test -v -timeout 10m ./...
+
+      - name: Build ANX binary (Unix)
+        if: runner.os != 'Windows'
+        run: go build -v -ldflags "-X main.Version=ci -X main.Commit=${{ github.sha }} -X main.Date=$(date -u +%Y-%m-%d)" -o bin/ ./cmd/anx
+
+      - name: Build ANX binary (Windows)
+        if: runner.os == 'Windows'
+        run: go build -v -ldflags "-X main.Version=ci -X main.Commit=${{ github.sha }} -X main.Date=ci" -o bin\anx.exe .\cmd\anx
+
+      - name: Test Windows bootstrap script (plan/dry-run)
+        if: runner.os == 'Windows'
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap_anx.ps1 plan
+
+  lint:
+    name: Shell & Code Linting
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node 26 LTS
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Check Shell scripts syntax
+        run: |
+          bash -n scripts/*.sh install.sh uninstall.sh files/security/anx-security
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck scripts/bootstrap_anx.sh install.sh uninstall.sh files/security/anx-security
+          fi
+
+      - name: Run Cloudflare Worker unit tests
+        run: |
+          node --test deploy/cloudflare/src/index.test.js
+
+  e2e:
+    name: E2E Integration (Docker)
+    runs-on: ubuntu-24.04
+    needs: [lint]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: true
+
+      - name: Set up Node 26 LTS
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Run Docker E2E Suite (Debian & Alpine)
+        run: |
+          docker compose -f tests/e2e/docker-compose.yml build
+          docker compose -f tests/e2e/docker-compose.yml up -d mock-server
+          docker compose -f tests/e2e/docker-compose.yml run -T --rm test-debian
+          docker compose -f tests/e2e/docker-compose.yml run -T --rm test-alpine
+          docker compose -f tests/e2e/docker-compose.yml down -v
+
+  e2e-build:
+    name: Build static Linux E2E binary
+    runs-on: ubuntu-24.04
+    needs: [lint]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Compile once for all five distros
+        run: |
+          mkdir -p tests/e2e/.artifacts
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o tests/e2e/.artifacts/anx ./cmd/anx
+      - uses: actions/upload-artifact@v7
+        with:
+          name: anx-e2e-linux-amd64
+          path: tests/e2e/.artifacts/anx
+          retention-days: 1
+          if-no-files-found: error
+
+  e2e-smoke:
+    name: E2E smoke (${{ matrix.distro }})
+    needs: [e2e-build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            image: debian:bookworm-slim
+          - distro: ubuntu
+            image: ubuntu:24.04
+          - distro: fedora
+            image: fedora:42
+          - distro: alpine
+            image: alpine:3.21
+          - distro: arch
+            image: archlinux:base
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: anx-e2e-linux-amd64
+          path: tests/e2e/.artifacts
+      - name: Run native distro runtime with no network or privileges
+        env:
+          BASE_IMAGE: ${{ matrix.image }}
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          chmod +x tests/e2e/.artifacts/anx
+          docker build -f tests/e2e/Dockerfile.matrix --build-arg BASE_IMAGE="$BASE_IMAGE" -t "anx-e2e-$DISTRO:$GITHUB_SHA" .
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 96 --memory 384m --cpus 1 --tmpfs /tmp:rw,size=64m,mode=1777 -e EXPECTED_DISTRO="$DISTRO" "anx-e2e-$DISTRO:$GITHUB_SHA"
+
+  e2e-arm64-linux:
+    name: ARM64 Linux smoke (not Android/Termux)
+    needs: [lint]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - name: Cross-build and execute under QEMU
+        run: |
+          mkdir -p tests/e2e/.artifacts
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o tests/e2e/.artifacts/anx ./cmd/anx
+          docker build --platform linux/arm64 -f tests/e2e/Dockerfile.matrix --build-arg BASE_IMAGE=ubuntu:24.04 -t anx-e2e-arm64 .
+          docker run --rm --platform linux/arm64 --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,size=64m,mode=1777 -e EXPECTED_DISTRO=ubuntu anx-e2e-arm64

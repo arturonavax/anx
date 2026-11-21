@@ -1,0 +1,9 @@
+# Universal minimal profile shipped with the ANX engine.
+# Full workstation, developer, and personal profiles live in the external
+# configuration repository (default: https://github.com/arturonavax/env).
+profiles:
+  - name: minimal
+    description: Minimal universal bootstrap profile (git, curl)
+    packages:
+      - git
+      - curl

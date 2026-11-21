@@ -1,0 +1,57 @@
+# Minimal universal bootstrap package defaults bundled with the ANX engine.
+# Full workstation packages, dotfiles, profiles, and hacks live in the user's
+# external configuration repository (default: https://github.com/arturonavax/env).
+packages:
+  - id: anx
+    name: ANX Environment Engine
+    category: core
+    description: Universal cross-platform environment orchestration engine
+    binary_name: anx
+    binary_aliases:
+      - aitools
+      - safe-suspend
+    strategies:
+      - type: script
+        when:
+          os: [linux, darwin]
+        depends_on: [curl]
+        script:
+          url: https://raw.githubusercontent.com/arturonavax/anx/main/install.sh
+          interpreter: sh
+          creates: "~/.local/bin/anx"
+
+  - id: git
+    name: Git
+    category: core
+    description: Distributed version control system
+    binary_name: git
+    strategies:
+      - type: native
+        packages:
+          apt: [git]
+          dnf: [git]
+          pacman: [git]
+          zypper: [git]
+          apk: [git]
+          brew: [git]
+          pkg: [git]
+          winget: [Git.Git]
+          scoop: [git]
+
+  - id: curl
+    name: cURL
+    category: core
+    description: Command-line tool for transferring data with URLs
+    binary_name: curl
+    strategies:
+      - type: native
+        packages:
+          apt: [curl]
+          dnf: [curl]
+          pacman: [curl]
+          zypper: [curl]
+          apk: [curl]
+          brew: [curl]
+          pkg: [curl]
+          winget: [cURL.cURL]
+          scoop: [curl]
