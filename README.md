@@ -54,11 +54,20 @@ automatic toolchain setup, install Go first and build from source.
 
 ### Windows
 
-Run the experimental ANX installer from PowerShell or Command Prompt:
+Install ANX for the current user on x64 or ARM64 from PowerShell or Command Prompt:
 
 ```cmd
 powershell.exe -NoProfile -Command "irm https://sh.arturonavax.dev/install.ps1 | iex"
 ```
+
+The installer tries a checksum-verified release first. If none is available, it
+can build ANX using an existing Go toolchain or a verified portable Go archive.
+It installs to `%LOCALAPPDATA%\Programs\anx\bin` and updates only the user
+`PATH`; it does not request elevation or change PowerShell execution policy.
+Open a new terminal and run `anx version` to verify the installation. Individual
+packages you later select for environment setup may still require elevation.
+Set `ANX_NO_PATH=1` before running the installer to leave your persistent user
+`PATH` unchanged.
 
 The quick command executes the downloaded script immediately. To inspect it first,
 download it from Command Prompt, review it, and then run it if your policy allows:

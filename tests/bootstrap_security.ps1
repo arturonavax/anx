@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $env:TEMP = $ScratchRoot
 $env:PROCESSOR_ARCHITECTURE = 'AMD64'
+$AnxArchitecture = 'amd64'
 $DestDir = Join-Path $ScratchRoot 'bin'
 New-Item -ItemType Directory -Path $DestDir | Out-Null
 $existingBinary = Join-Path $DestDir 'anx.exe'
@@ -44,8 +45,11 @@ function Invoke-WebRequest {
     }
 }
 
-function Expand-Archive {
-    param([Alias('Path')][string]$LiteralPath, [string]$DestinationPath, [switch]$Force)
+function Get-AnxSHA256([string]$path) {
+    (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+}
+
+function Expand-AnxZip([string]$archive, [string]$destination) {
     $script:extractCount++
     # Stop at the extraction boundary; never stage or run an executable.
 }
