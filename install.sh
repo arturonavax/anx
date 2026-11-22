@@ -39,39 +39,6 @@ for _brew_bin in /opt/homebrew/bin /usr/local/bin; do
 done
 export PATH
 
-# Self-heal broken /etc/pam.d/sudo_local (e.g. missing /opt/homebrew/.../pam_reattach.so after an
-# interrupted destroyer run) in user-space without sudo so that subsequent sudo calls can initialize PAM.
-repair_macos_sudo_pam_if_needed() {
-	[ "$(uname -s 2>/dev/null || true)" = "Darwin" ] || return 0
-	[ -r /etc/pam.d/sudo_local ] || return 0
-	_shim=""
-	for _cand in /usr/lib/pam/pam_permit.so.2 /usr/lib/pam/pam_permit.so /usr/lib/pam/pam_deny.so.2 /usr/lib/pam/pam_deny.so; do
-		if [ -f "$_cand" ]; then
-			_shim="$_cand"
-			break
-		fi
-	done
-	[ -n "$_shim" ] || return 0
-	while IFS= read -r _line || [ -n "$_line" ]; do
-		case "$_line" in
-		"" | \#*) continue ;;
-		esac
-		for _tok in $_line; do
-			case "$_tok" in
-			/*.so)
-				if [ ! -f "$_tok" ]; then
-					_dir="$(dirname "$_tok")"
-					mkdir -p "$_dir" 2>/dev/null || true
-					rm -f "$_tok" 2>/dev/null || true
-					ln -sfn "$_shim" "$_tok" 2>/dev/null || true
-				fi
-				;;
-			esac
-		done
-	done </etc/pam.d/sudo_local
-}
-repair_macos_sudo_pam_if_needed
-
 # Locate ANX engine repository root if running inside an existing checkout
 REPO_ROOT=""
 cur="${PWD:-.}"
@@ -433,7 +400,7 @@ try_download_release_direct() {
 		return 1
 	fi
 
-	tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t anx-release)"
+	tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t anx-release)" || return 1
 	tarball="${tmp_dir}/${archive_name}"
 	sums_file="${tmp_dir}/SHA256SUMS"
 
@@ -451,32 +418,31 @@ try_download_release_direct() {
 	fi
 
 	if [ "$dl_ok" -eq 1 ] && [ -s "$tarball" ] && [ -s "$sums_file" ]; then
-		# Checksum verification (fail-closed)
-		want_sum="$(grep "${archive_name}" "$sums_file" 2>/dev/null | awk '{print $1}' || true)"
-		if [ -z "$want_sum" ]; then
-			echo "  [WARN] Release asset checksum not found in SHA256SUMS." >&2
-			rm -rf "$tmp_dir"
-			return 1
-		fi
-		if ! echo "$want_sum" | grep -Eq '^[0-9a-fA-F]{64}$'; then
-			echo "  [WARN] Invalid checksum format for release asset." >&2
+		# Verify one exact checksum record before inspecting or extracting the archive.
+		if ! want_sum="$(awk -v name="$archive_name" '
+			$2 == name || $2 == "*" name {
+				count++
+				if (NF == 2) digest = tolower($1)
+			}
+			END { if (count != 1) exit 1; print digest }
+		' "$sums_file")" || ! printf '%s\n' "$want_sum" | grep -Eq '^[0-9a-f]{64}$'; then
+			echo "  [WARN] Missing, invalid, or ambiguous checksum for $archive_name." >&2
 			rm -rf "$tmp_dir"
 			return 1
 		fi
 
-		computed_sum=""
+		hash_output=""
 		if command -v sha256sum >/dev/null 2>&1; then
-			computed_sum="$(sha256sum "$tarball" | awk '{print $1}')"
+			hash_output="$(sha256sum "$tarball")" || hash_output=""
 		elif command -v shasum >/dev/null 2>&1; then
-			computed_sum="$(shasum -a 256 "$tarball" | awk '{print $1}')"
+			hash_output="$(shasum -a 256 "$tarball")" || hash_output=""
 		else
 			echo "  [WARN] Neither sha256sum nor shasum available to verify checksum." >&2
-			rm -rf "$tmp_dir"
-			return 1
 		fi
+		computed_sum="$(printf '%s\n' "$hash_output" | awk 'NR == 1 { print tolower($1) }')" || computed_sum=""
 
 		if [ "$computed_sum" != "$want_sum" ]; then
-			echo "  [WARN] Release asset checksum mismatch. Computed: $computed_sum, expected: $want_sum." >&2
+			echo "  [WARN] Could not verify the release checksum for $archive_name." >&2
 			rm -rf "$tmp_dir"
 			return 1
 		fi

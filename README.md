@@ -10,34 +10,34 @@
 
 ## Installation
 
+Start from a trusted checkout. Review the ref and install script before running
+it; do not pipe a mutable remote script directly into a shell. Configuration
+repositories can run scripts too: use only repositories you trust.
+
+```sh
+git clone https://github.com/arturonavax/anx.git
+cd anx
+```
+
 ### Linux / macOS
 
 ```sh
-curl -fsSL https://sh.arturonavax.dev/install.sh | sh
+sh ./install.sh --install-only
 ```
+
+The bootstrap does not install GVM or Homebrew automatically. When Go is
+missing, it can use an existing GVM or native package manager. To avoid
+automatic toolchain setup, install Go first and build from source.
+
+### From source (including Windows)
+
+[Install Go](https://go.dev/dl/) and run this from the reviewed checkout:
 
 ```sh
-# Or with a custom configuration repository:
-curl -fsSL https://sh.arturonavax.dev/install.sh \
-  | sh -s -- --config-repo git@github.com:someone/env.git --profile developer
+go install ./cmd/anx
 ```
 
-### Windows (PowerShell)
-
-```powershell
-irm https://sh.arturonavax.dev/install.ps1 | iex
-```
-
-```powershell
-# Or with a custom configuration repository:
-& ([scriptblock]::Create((irm https://sh.arturonavax.dev/install.ps1))) -ConfigRepo "https://github.com/someone/env.git"
-```
-
-### From Source
-
-```sh
-go install github.com/arturonavax/anx/cmd/anx@latest
-```
+The standalone Windows PowerShell installer is experimental.
 
 ## Key Commands
 
@@ -72,6 +72,8 @@ anx tools source verify <id>
 
 ## Security & Git Authentication
 
+- Release checksums detect a missing or mismatched download. A checksum from
+  the same release is not a signature or independent proof of publisher identity.
 - Automatic non-interactive SSH discovery (`GIT_TERMINAL_PROMPT=0`, `BatchMode=yes`) with HTTPS credential-helper fallback when `auth: auto`.
 - Never disables SSH host-key verification (`StrictHostKeyChecking=no` is strictly prohibited).
 - Never persists credentials in repository URLs or logs.

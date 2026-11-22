@@ -413,7 +413,7 @@ exit 1
 			t.Errorf("expected wizard one-shot run to create %s: %v", filepath.Join(home, ".zshrc"), err)
 		}
 
-		// 2. Fresh GVM installer mock: must pass GVM_NO_UPDATE_PROFILE=1 and hide restart-terminal noise.
+		// 2. An already installed GVM can activate Go in a fresh home without a remote installer.
 		home2 := filepath.Join(tmp, "home2")
 		if err := os.MkdirAll(home2, 0o755); err != nil {
 			t.Fatal(err)
@@ -425,19 +425,11 @@ exit 1
 		if err := os.Rename(filepath.Join(binDir, "go"), filepath.Join(goGvmDir, "go")); err != nil {
 			t.Fatal(err)
 		}
-		gvmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/gvm-installer" {
-				http.NotFound(w, r)
-				return
-			}
-			_, _ = w.Write([]byte(`#!/usr/bin/env bash
-if [ -z "${GVM_NO_UPDATE_PROFILE:-}" ]; then
-  echo "Unable to locate profile settings file" >&2
-  exit 1
-fi
-mkdir -p "$HOME/.gvm/scripts"
-cat <<'EOS' > "$HOME/.gvm/scripts/gvm"
-export GVM_ROOT="$HOME/.gvm"
+		gvmPath := filepath.Join(home2, ".gvm", "scripts", "gvm")
+		if err := os.MkdirAll(filepath.Dir(gvmPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		installedGVM := `export GVM_ROOT="$HOME/.gvm"
 cd() {
   if [ "${GVM_DEBUG}" -eq 1 ]; then echo "DBG"; fi
   return 1
@@ -457,11 +449,10 @@ gvm() {
   return 1
 }
 cd .
-EOS
-echo "Please restart your terminal session or run source $HOME/.gvm/scripts/gvm"
-`))
-		}))
-		defer gvmSrv.Close()
+`
+		if err := os.WriteFile(gvmPath, []byte(installedGVM), 0o644); err != nil {
+			t.Fatal(err)
+		}
 
 		cmdEnsureOnly := exec.Command("bash", filepath.Join(repoRoot, "scripts", "bootstrap_anx.sh"), "--ensure-go-only")
 		cmdEnsureOnly.Env = []string{
@@ -470,7 +461,6 @@ echo "Please restart your terminal session or run source $HOME/.gvm/scripts/gvm"
 			"ANX_SKIP_CLT=1",
 			"ANX_SKIP_HOMEBREW=1",
 			"ANX_GO_SYS_BIN=" + filepath.Join(tmp, "no-sys-go"),
-			"ANX_GVM_INSTALLER_URL=" + gvmSrv.URL + "/gvm-installer",
 		}
 		outEnsureOnly, err := cmdEnsureOnly.CombinedOutput()
 		if err != nil {

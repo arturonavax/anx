@@ -8,9 +8,8 @@
 #   1. Tier 0.5: Direct 'go install' if Go is present and requested
 #   2. Pre-flight check for Go (>= 1.27.3)
 #   3. If missing or outdated:
-#      - Tier 1: GVM (Go Version Manager) binary release
-#      - Tier 2: Personal standalone installer (src/remotes/install_golang.sh -i)
-#      - Tier 3: Native package manager (brew, pacman, dnf, apt, apk)
+#      - Tier 1: Use an already installed GVM (Go Version Manager)
+#      - Tier 2: Native package manager (brew, pacman, dnf, apt, apk)
 #   4. Compile ANX binary with embedded version metadata
 #   5. Symlink 'safe-suspend' -> 'anx' for multicall binary compatibility
 #   6. Delegate forwarded arguments to ANX CLI
@@ -176,43 +175,10 @@ pick_latest_clt_label() {
 	'
 }
 
-repair_macos_sudo_pam_if_needed() {
-	if [[ "$(uname -s)" != "Darwin" ]] || [[ ! -r /etc/pam.d/sudo_local ]]; then
-		return 0
-	fi
-	local shim="" cand line tok dir
-	for cand in /usr/lib/pam/pam_permit.so.2 /usr/lib/pam/pam_permit.so /usr/lib/pam/pam_deny.so.2 /usr/lib/pam/pam_deny.so; do
-		if [[ -f "${cand}" ]]; then
-			shim="${cand}"
-			break
-		fi
-	done
-	[[ -n "${shim}" ]] || return 0
-
-	while IFS= read -r line || [[ -n "${line}" ]]; do
-		case "${line}" in
-		"" | \#*) continue ;;
-		esac
-		for tok in ${line}; do
-			case "${tok}" in
-			/*.so)
-				if [[ ! -f "${tok}" ]]; then
-					dir="$(dirname "${tok}")"
-					mkdir -p "${dir}" 2>/dev/null || true
-					rm -f "${tok}" 2>/dev/null || true
-					ln -sfn "${shim}" "${tok}" 2>/dev/null || true
-				fi
-				;;
-			esac
-		done
-	done </etc/pam.d/sudo_local
-}
-
 ensure_macos_clt() {
 	if [[ "$(uname -s)" != "Darwin" ]] || [[ "${ANX_SKIP_CLT:-0}" -eq 1 ]]; then
 		return 0
 	fi
-	repair_macos_sudo_pam_if_needed
 	if has_macos_clt; then
 		return 0
 	fi
@@ -269,33 +235,13 @@ ensure_macos_clt() {
 	fi
 }
 
-ensure_macos_homebrew() {
-	if [[ "$(uname -s)" != "Darwin" ]] || [[ "${ANX_SKIP_HOMEBREW:-0}" -eq 1 ]]; then
+warn_if_homebrew_missing() {
+	if [[ "${ANX_SKIP_HOMEBREW:-0}" -eq 1 ]]; then
 		return 0
 	fi
-	ensure_macos_homebrew_env
-	if command -v brew >/dev/null 2>&1; then
-		return 0
+	if ! command -v brew >/dev/null 2>&1; then
+		log_info "Homebrew is not installed. Install it separately if you want to use it."
 	fi
-	if ! has_macos_clt || ! command -v curl >/dev/null 2>&1; then
-		log_warn "Skipping automatic Homebrew setup (requires Xcode CLT and curl)."
-		return 0
-	fi
-
-	log_step "Homebrew not detected on macOS; installing Homebrew..."
-	local tmp_brew
-	tmp_brew="$(mktemp "${TMPDIR:-/tmp}/anx-brew-install.XXXXXX")"
-	if curl -fsSL "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh" -o "${tmp_brew}"; then
-		if [[ -c /dev/tty ]] && ( : </dev/tty ) 2>/dev/null; then
-			{ NONINTERACTIVE=1 /bin/bash "${tmp_brew}"; } </dev/tty || log_warn "Homebrew installation failed; native macOS package installs will wait until 'brew' is installed."
-		else
-			NONINTERACTIVE=1 /bin/bash "${tmp_brew}" || log_warn "Homebrew installation failed; native macOS package installs will wait until 'brew' is installed."
-		fi
-	else
-		log_warn "Could not download Homebrew installer script."
-	fi
-	rm -f "${tmp_brew}"
-	ensure_macos_homebrew_env
 }
 
 # ------------------------------------------------------------------------------
@@ -311,6 +257,38 @@ detect_os_arch() {
 		*) arch="amd64" ;;
 	esac
 	echo "${os}_${arch}"
+}
+
+verify_release_checksum() {
+	local archive="$1" sums_file="$2" archive_name="$3"
+	local expected actual hash_output
+
+	if ! expected="$(awk -v name="${archive_name}" '
+		$2 == name || $2 == "*" name {
+			count++
+			if (NF == 2) digest = tolower($1)
+		}
+		END { if (count != 1) exit 1; print digest }
+	' "${sums_file}")" || [[ ! "${expected}" =~ ^[0-9a-f]{64}$ ]]; then
+		log_warn "Missing, invalid, or ambiguous checksum for ${archive_name}."
+		return 1
+	fi
+
+	if command -v sha256sum >/dev/null 2>&1; then
+		hash_output="$(sha256sum "${archive}")" || return 1
+	elif command -v shasum >/dev/null 2>&1; then
+		hash_output="$(shasum -a 256 "${archive}")" || return 1
+	else
+		log_warn "Neither sha256sum nor shasum is available to verify ${archive_name}."
+		return 1
+	fi
+
+	actual="$(awk 'NR == 1 { print tolower($1) }' <<< "${hash_output}")" || return 1
+	if [[ "${actual}" != "${expected}" ]]; then
+		log_warn "Checksum verification failed for ${archive_name}."
+		return 1
+	fi
+	log_success "Checksum verified: ${expected}"
 }
 
 try_download_release_binary() {
@@ -332,7 +310,7 @@ try_download_release_binary() {
 	fi
 
 	local tmp_dir
-	tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t anx-release)"
+	tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t anx-release)" || return 1
 	local tarball="${tmp_dir}/${archive_name}"
 	local sums_file="${tmp_dir}/SHA256SUMS"
 
@@ -349,26 +327,9 @@ try_download_release_binary() {
 		fi
 	fi
 
-	if [[ "${dl_ok}" -eq 1 && -s "${tarball}" && -s "${sums_file}" ]]; then
-		# Checksum verification before extraction
-		local want_sum computed_sum
-		want_sum=$(grep "${archive_name}" "${sums_file}" 2>/dev/null | awk '{print $1}' || true)
-		if [[ -n "${want_sum}" ]]; then
-			if command -v sha256sum >/dev/null 2>&1; then
-				computed_sum=$(sha256sum "${tarball}" | awk '{print $1}')
-			elif command -v shasum >/dev/null 2>&1; then
-				computed_sum=$(shasum -a 256 "${tarball}" | awk '{print $1}')
-			fi
-
-			if [[ -n "${computed_sum:-}" && "${computed_sum}" != "${want_sum}" ]]; then
-				log_warn "Checksum verification failed for ${archive_name}. Expected ${want_sum}, got ${computed_sum}"
-				rm -rf "${tmp_dir}"
-				return 1
-			fi
-			log_success "Checksum verified: ${want_sum}"
-		fi
-
-		# Safe isolated extraction
+	if [[ "${dl_ok}" -eq 1 && -s "${tarball}" && -s "${sums_file}" ]] &&
+		verify_release_checksum "${tarball}" "${sums_file}" "${archive_name}"; then
+		# Extract only after the downloaded archive matches the expected checksum.
 		local extract_dir="${tmp_dir}/extracted"
 		mkdir -p "${extract_dir}"
 		if tar -xzf "${tarball}" -C "${extract_dir}" 2>/dev/null; then
@@ -454,32 +415,15 @@ check_go_version() {
 # Go Installation Tiers
 # ------------------------------------------------------------------------------
 install_go_tier1_gvm() {
-	log_step "Tier 1: Attempting Go installation via GVM (Go Version Manager)..."
+	log_step "Tier 1: Checking for an existing Go Version Manager (GVM)..."
 
 	if ! has_usable_git; then
-		log_info "Usable git not detected; skipping Tier 1 (GVM) in favor of standalone Go binary installer."
+		log_info "Usable git not detected; skipping Tier 1 (GVM)."
 		return 1
 	fi
 
 	if ! command -v gvm >/dev/null 2>&1; then
-		if [[ -s "${HOME}/.gvm/scripts/gvm" ]]; then
-			source_gvm_safely || true
-		fi
-		if ! command -v gvm >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
-			if [[ -d "${HOME}/.gvm" && ! -s "${HOME}/.gvm/scripts/gvm" ]]; then
-				rm -rf "${HOME}/.gvm"
-			fi
-			log_info "Installing GVM..."
-			local tmp_gvm_installer tmp_gvm_log gvm_installer_url
-			tmp_gvm_installer="$(mktemp "${TMPDIR:-/tmp}/anx-gvm-installer.XXXXXX")"
-			tmp_gvm_log="$(mktemp "${TMPDIR:-/tmp}/anx-gvm-log.XXXXXX")"
-			gvm_installer_url="${ANX_GVM_INSTALLER_URL:-https://raw.githubusercontent.com/moovweb/gvm/master/binscripts/gvm-installer}"
-			if curl -fsSL "${gvm_installer_url}" -o "${tmp_gvm_installer}"; then
-				GVM_NO_UPDATE_PROFILE=1 bash "${tmp_gvm_installer}" >"${tmp_gvm_log}" 2>&1 || true
-			fi
-			rm -f "${tmp_gvm_installer}" "${tmp_gvm_log}"
-			source_gvm_safely || true
-		fi
+		source_gvm_safely || true
 	fi
 
 	if command -v gvm >/dev/null 2>&1; then
@@ -494,30 +438,8 @@ install_go_tier1_gvm() {
 	return 1
 }
 
-install_go_tier2_standalone() {
-	log_step "Tier 2: Attempting Go installation via personal standalone installer..."
-	local script_path="${REPO_ROOT}/scripts/install_golang.sh"
-	if [[ -f "${script_path}" ]]; then
-		bash "${script_path}" -i || return 1
-	elif command -v curl >/dev/null 2>&1; then
-		curl -fsSL "https://env.arturonavax.dev/install_golang.sh" | bash -s -- -i || return 1
-	else
-		return 1
-	fi
-
-	if [[ -d "${GO_SYS_BIN}" ]]; then
-		export PATH="${GO_SYS_BIN}:${PATH}"
-	fi
-
-	if check_go_version; then
-		log_success "Go $(go version | awk '{print $3}') installed via standalone script."
-		return 0
-	fi
-	return 1
-}
-
-install_go_tier3_package_manager() {
-	log_step "Tier 3: Attempting Go installation via native package manager..."
+install_go_via_package_manager() {
+	log_step "Tier 2: Attempting Go installation via native package manager..."
 	if command -v brew >/dev/null 2>&1; then
 		brew install go || return 1
 	elif command -v pacman >/dev/null 2>&1; then
@@ -574,15 +496,9 @@ ensure_go_runtime() {
 		expose_go_binaries_in_local_bin
 		return 0
 	fi
-	log_warn "Tier 1 (GVM) did not succeed. Falling back to Tier 2 (standalone script)..."
+	log_warn "Tier 1 (GVM) did not succeed. Falling back to Tier 2 (native package manager)..."
 
-	if install_go_tier2_standalone; then
-		expose_go_binaries_in_local_bin
-		return 0
-	fi
-	log_warn "Tier 2 (standalone script) did not succeed. Falling back to Tier 3 (package manager)..."
-
-	if install_go_tier3_package_manager; then
+	if install_go_via_package_manager; then
 		expose_go_binaries_in_local_bin
 		return 0
 	fi
@@ -770,9 +686,8 @@ main() {
 	fi
 
 	if [[ "$(uname -s)" == "Darwin" && "${readonly_action}" -eq 0 ]]; then
-		repair_macos_sudo_pam_if_needed
 		ensure_macos_clt
-		ensure_macos_homebrew
+		warn_if_homebrew_missing
 	fi
 
 	if [[ "${ensure_go_only}" -eq 1 ]]; then

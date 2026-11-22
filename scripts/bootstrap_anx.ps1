@@ -138,6 +138,7 @@ function Try-DownloadReleaseBinary {
     $sumsUrl = "https://github.com/arturonavax/anx/releases/latest/download/SHA256SUMS"
 
     Write-Step "Checking for verified pre-compiled ANX release ($archiveName)..."
+    $tempDir = $null
     try {
         $tempDir = Join-Path $env:TEMP ("anx-release-" + [System.Guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
@@ -147,37 +148,48 @@ function Try-DownloadReleaseBinary {
         Invoke-WebRequest -Uri $releaseUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 30
         Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsPath -UseBasicParsing -TimeoutSec 15
 
-        if ((Test-Path $zipPath) -and (Test-Path $sumsPath)) {
-            $sumsContent = Get-Content -Path $sumsPath -Raw
-            $match = [regex]::Match($sumsContent, "([a-fA-F0-9]{64})\s+\*?" + [regex]::Escape($archiveName))
-            if ($match.Success) {
-                $expectedHash = $match.Groups[1].Value.ToLower()
-                $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
-                if ($actualHash -ne $expectedHash) {
-                    Write-WarnMsg "Release checksum mismatch! Expected $expectedHash, got $actualHash"
-                    Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-                    return $false
-                }
-                Write-Success "Release checksum verified: $actualHash"
+        $expectedHash = $null
+        foreach ($line in (Get-Content -LiteralPath $sumsPath)) {
+            $fields = $line.Trim() -split '\s+'
+            if ($fields.Count -lt 2 -or ($fields[1] -cne $archiveName -and $fields[1] -cne "*$archiveName")) {
+                continue
             }
-
-            $extractDir = Join-Path $tempDir "extract"
-            Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-            $anxStaged = Join-Path $extractDir "anx.exe"
-            if (Test-Path $anxStaged) {
-                # Self test
-                & $anxStaged version | Out-Null
-                $targetExe = Join-Path $DestDir "anx.exe"
-                Move-Item -Path $anxStaged -Destination $targetExe -Force
-                Copy-Item -Path $targetExe -Destination (Join-Path $DestDir "safe-suspend.exe") -Force
-                Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Success "Deployed verified release binary to $targetExe"
-                return $true
+            if ($expectedHash -or $fields.Count -ne 2 -or $fields[0] -notmatch '^[a-fA-F0-9]{64}$') {
+                Write-WarnMsg "Invalid or ambiguous checksum for $archiveName."
+                return $false
             }
+            $expectedHash = $fields[0]
         }
-        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not $expectedHash) {
+            Write-WarnMsg "Missing checksum for $archiveName."
+            return $false
+        }
+
+        $actualHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+        if ($actualHash -ne $expectedHash) {
+            Write-WarnMsg "Release checksum mismatch for $archiveName."
+            return $false
+        }
+        Write-Success "Release checksum verified: $actualHash"
+
+        $extractDir = Join-Path $tempDir "extract"
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+        $anxStaged = Join-Path $extractDir "anx.exe"
+        if (Test-Path -LiteralPath $anxStaged -PathType Leaf) {
+            & $anxStaged version | Out-Null
+            if ($LASTEXITCODE -ne 0) { return $false }
+            $targetExe = Join-Path $DestDir "anx.exe"
+            Move-Item -LiteralPath $anxStaged -Destination $targetExe -Force
+            Copy-Item -LiteralPath $targetExe -Destination (Join-Path $DestDir "safe-suspend.exe") -Force
+            Write-Success "Deployed verified release binary to $targetExe"
+            return $true
+        }
     } catch {
-        # Fall back to compilation
+        Write-WarnMsg "Could not verify and install $archiveName. Trying the next installation method."
+    } finally {
+        if ($tempDir) {
+            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
     return $false
 }
