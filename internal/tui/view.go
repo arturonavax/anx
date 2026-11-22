@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/arturonavax/anx/internal/app"
 	"github.com/arturonavax/anx/internal/security"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // View renders the TUI screen returning tea.View (Bubble Tea v2).
@@ -30,10 +31,7 @@ func (m Model) View() tea.View {
 		availHeight = 4
 	}
 
-	availWidth := m.width
-	if availWidth < 40 {
-		availWidth = 40
-	}
+	availWidth := m.effectiveWidth()
 
 	var content string
 	if m.showHelp {
@@ -67,7 +65,12 @@ func (m Model) View() tea.View {
 }
 
 func (m Model) renderHeader() string {
-	title := m.styles.Header.Render("  ANX  ") + m.styles.Muted.Render(" — Developer Environment Orchestrator (Go/Tokyo Night)")
+	badge := RenderFoxBadge(m.logoFrame, m.isNoColor())
+	themeName := m.styles.Palette.Name
+	if themeName == "" {
+		themeName = "default"
+	}
+
 	platStr := "unknown"
 	if m.deps.Platform != nil {
 		platStr = fmt.Sprintf("%s/%s", m.deps.Platform.OS(), m.deps.Platform.Arch())
@@ -75,8 +78,13 @@ func (m Model) renderHeader() string {
 			platStr += fmt.Sprintf(" (%s)", dist)
 		}
 	}
-	info := m.styles.Highlight.Render(platStr)
-	return fmt.Sprintf("%s  [%s]", title, info)
+
+	title := m.styles.Header.Render("ANX")
+	subtitle := m.styles.Muted.Render(" — Environment Orchestrator")
+	themePill := m.styles.BadgeGold.Render("[" + themeName + "]")
+	platPill := m.styles.Highlight.Render("[" + platStr + "]")
+	line := fmt.Sprintf(" %s %s%s  %s %s", badge, title, subtitle, themePill, platPill)
+	return ansi.Truncate(line, m.effectiveWidth(), "…")
 }
 
 func (m Model) renderTabs() string {
@@ -90,24 +98,39 @@ func (m Model) renderTabs() string {
 		}
 		sb.WriteString(" ")
 	}
-	return sb.String()
+	return ansi.Truncate(sb.String(), m.effectiveWidth(), "")
 }
 
 func (m Model) renderStatusBar() string {
-	shortcuts := m.styles.Muted.Render(" [Tab] Next Tab  [1-8] Tab Jump  [j/k] Navigate  [r] Refresh  [a] Accordion  [?] Help  [q] Quit")
-	msg := m.styles.Highlight.Render(" " + m.statusMsg)
+	w := m.effectiveWidth()
+	keycaps := strings.Join([]string{
+		RenderKeyCap(m.styles, "Tab", "Switch"),
+		RenderKeyCap(m.styles, "1-8", "Jump"),
+		RenderKeyCap(m.styles, "j/k", "Navigate"),
+		RenderKeyCap(m.styles, "r", "Refresh"),
+		RenderKeyCap(m.styles, "a", "Accordion"),
+		RenderKeyCap(m.styles, "?", "Help"),
+		RenderKeyCap(m.styles, "q", "Quit"),
+	}, "  ")
+	shortcuts := ansi.Truncate(" "+keycaps, w, "…")
+	dot := m.styles.BadgeGold.Render("●")
+	msg := ansi.Truncate(" "+dot+" "+m.styles.Highlight.Render(m.statusMsg), w, "…")
 	return fmt.Sprintf("%s\n%s", shortcuts, msg)
 }
 
 func (m Model) renderOverview(w, h int) string {
 	// 1. Health Status Calculations & Badges
+	passed := 0
 	fails := 0
 	warns := 0
 	for _, c := range m.doctorChecks {
-		if c.Verdict == app.VerdictFail {
+		switch c.Verdict {
+		case app.VerdictFail:
 			fails++
-		} else if c.Verdict == app.VerdictWarn {
+		case app.VerdictWarn:
 			warns++
+		default:
+			passed++
 		}
 	}
 
@@ -122,12 +145,37 @@ func (m Model) renderOverview(w, h int) string {
 		healthBanner = m.styles.Warning.Render(fmt.Sprintf("▲ HEALTH STATUS: %d WARNING(S) FOUND", warns))
 	}
 
+	// 2. Responsive Animated Burgundy-Crimson-Gold Fox Hero
+	noColor := m.isNoColor()
+	var heroSection string
+	bodyH := h
+	switch {
+	case w >= 88 && h >= 22:
+		heroInnerW := w - 4
+		heroArt := RenderFoxLogo(heroInnerW, 30, m.logoFrame, noColor)
+		heroLines := strings.Split(heroArt, "\n")
+		heroPanelH := len(heroLines) + 2
+		heroSection = BuildPanel(m.styles, heroLines, w, heroPanelH, true)
+		bodyH = h - heroPanelH
+	case w >= 60 && h >= 14:
+		heroInnerW := w - 4
+		heroArt := RenderFoxLogo(heroInnerW, 20, m.logoFrame, noColor)
+		heroLines := strings.Split(heroArt, "\n")
+		heroPanelH := len(heroLines) + 2
+		heroSection = BuildPanel(m.styles, heroLines, w, heroPanelH, true)
+		bodyH = h - heroPanelH
+	}
+	if bodyH < 5 {
+		bodyH = 5
+	}
+
+	var body string
 	if m.isWideLayout() {
 		leftW, rightW := m.calculateDualPaneWidths()
 		p := m.deps.Platform
 
 		leftLines := []string{
-			m.styles.Highlight.Render("SYSTEM SUMMARY"),
+			m.styles.CardTitle.Render("◆ SYSTEM SUMMARY"),
 			fmt.Sprintf("• Host OS:        %s", p.OS()),
 			fmt.Sprintf("• Architecture:   %s", p.Arch()),
 			fmt.Sprintf("• Distribution:   %s", p.Distribution()),
@@ -137,7 +185,7 @@ func (m Model) renderOverview(w, h int) string {
 			fmt.Sprintf("• Config Root:    %s", p.ConfigDir()),
 			fmt.Sprintf("• State Root:     %s", p.StateDir()),
 			"",
-			m.styles.Highlight.Render("CORE COMMANDS"),
+			m.styles.CardTitle.Render("◆ CORE COMMANDS"),
 			"• anx apply       Apply desired workstation state",
 			"• anx update      Check repo, tools & dotfile updates",
 			"• anx upgrade     Pull repo, update tools & sync",
@@ -150,15 +198,21 @@ func (m Model) renderOverview(w, h int) string {
 
 		rightLines := []string{
 			healthBanner,
+		}
+		if len(m.doctorChecks) > 0 {
+			ratio := float64(passed) / float64(len(m.doctorChecks))
+			rightLines = append(rightLines, fmt.Sprintf("  Health Score: %s (%d/%d passed)", RenderProgressGauge(m.styles, ratio, 16), passed, len(m.doctorChecks)))
+		}
+		rightLines = append(rightLines,
 			"",
-			m.styles.Highlight.Render("ENVIRONMENT METRICS & HEALTH"),
+			m.styles.CardTitle.Render("◆ ENVIRONMENT METRICS & HEALTH"),
 			fmt.Sprintf("• Tools & Packages: %d registered (%d tools, %d deps)", len(m.packages), len(m.tools), len(m.depsList)),
 			fmt.Sprintf("• Managed Configs:  %d assets in files/ (%d integrated)", len(m.configs), len(m.integratedConfigs)),
 			fmt.Sprintf("• Detected Hacks:   %d system tweaks", len(m.detectedHacks)),
 			fmt.Sprintf("• Active Palette:   %s", m.styles.Palette.Name),
 			"",
-			m.styles.Highlight.Render("LATEST HEALTH FINDINGS"),
-		}
+			m.styles.CardTitle.Render("◆ LATEST HEALTH FINDINGS"),
+		)
 		for _, c := range m.doctorChecks {
 			icon := m.styles.Success.Render("✓")
 			if c.Verdict == app.VerdictWarn {
@@ -169,8 +223,8 @@ func (m Model) renderOverview(w, h int) string {
 			rightLines = append(rightLines, fmt.Sprintf(" %s %s: %s", icon, c.Name, c.Message))
 		}
 
-		// 2. Background Update & Upgrade Check Findings
-		rightLines = append(rightLines, "", m.styles.Highlight.Render("UPDATES & SYNCHRONIZATION (BACKGROUND)"))
+		// Background Update & Upgrade Check Findings
+		rightLines = append(rightLines, "", m.styles.CardTitle.Render("◆ UPDATES & SYNCHRONIZATION (BACKGROUND)"))
 		if m.updateCheck != nil {
 			if m.updateCheck.HasUpdates {
 				if m.updateCheck.RepoBehind > 0 {
@@ -197,37 +251,46 @@ func (m Model) renderOverview(w, h int) string {
 			rightLines = append(rightLines, m.styles.Muted.Render("⟳ Checking repository commits & dotfile drifts in background..."))
 		}
 
-		leftPanel := BuildPanel(m.styles, leftLines, leftW, h, m.focusedPanel == "left")
-		rightPanel := BuildPanel(m.styles, rightLines, rightW, h, m.focusedPanel == "right")
-		return JoinHorizontal(leftPanel, rightPanel, 2)
+		leftPanel := BuildPanel(m.styles, leftLines, leftW, bodyH, m.focusedPanel == "left")
+		rightPanel := BuildPanel(m.styles, rightLines, rightW, bodyH, m.focusedPanel == "right")
+		body = JoinHorizontal(leftPanel, rightPanel, 2)
+	} else {
+		lines := make([]string, 0, 16)
+		if heroSection == "" {
+			lines = append(lines, RenderFoxLogo(w-4, 10, m.logoFrame, noColor))
+		}
+		lines = append(lines,
+			healthBanner,
+			"",
+			m.styles.CardTitle.Render("◆ SYSTEM OVERVIEW"),
+			fmt.Sprintf("OS: %s | Arch: %s | Distro: %s", m.deps.Platform.OS(), m.deps.Platform.Arch(), m.deps.Platform.Distribution()),
+			fmt.Sprintf("Packages: %d (%d tools, %d deps) | Configs: %d | Hacks: %d", len(m.packages), len(m.tools), len(m.depsList), len(m.configs), len(m.detectedHacks)),
+			"",
+			m.styles.CardTitle.Render("◆ HEALTH CHECKS"),
+		)
+		for _, c := range m.doctorChecks {
+			lines = append(lines, fmt.Sprintf("• %s: %s", c.Name, c.Message))
+		}
+		if m.updateCheck != nil {
+			lines = append(lines, "", m.styles.CardTitle.Render("◆ UPDATES & SYNCHRONIZATION"))
+			if m.updateCheck.HasUpdates {
+				if m.updateCheck.RepoBehind > 0 {
+					lines = append(lines, m.styles.Warning.Render(fmt.Sprintf("• Repo: %d commit(s) behind (run 'anx upgrade')", m.updateCheck.RepoBehind)))
+				}
+				if m.updateCheck.ConfigDrifts > 0 {
+					lines = append(lines, m.styles.Warning.Render(fmt.Sprintf("• Drifts: %d configuration drift(s) (run 'anx sync')", m.updateCheck.ConfigDrifts)))
+				}
+			} else {
+				lines = append(lines, m.styles.Success.Render("✓ Repository and dotfiles are fully up to date"))
+			}
+		}
+		body = BuildPanel(m.styles, lines, w, bodyH, true)
 	}
 
-	lines := []string{
-		healthBanner,
-		"",
-		m.styles.Highlight.Render("SYSTEM OVERVIEW"),
-		fmt.Sprintf("OS: %s | Arch: %s | Distro: %s", m.deps.Platform.OS(), m.deps.Platform.Arch(), m.deps.Platform.Distribution()),
-		fmt.Sprintf("Packages: %d (%d tools, %d deps) | Configs: %d | Hacks: %d", len(m.packages), len(m.tools), len(m.depsList), len(m.configs), len(m.detectedHacks)),
-		"",
-		m.styles.Highlight.Render("HEALTH CHECKS"),
+	if heroSection != "" {
+		return heroSection + "\n" + body
 	}
-	for _, c := range m.doctorChecks {
-		lines = append(lines, fmt.Sprintf("• %s: %s", c.Name, c.Message))
-	}
-	if m.updateCheck != nil {
-		lines = append(lines, "", m.styles.Highlight.Render("UPDATES & SYNCHRONIZATION"))
-		if m.updateCheck.HasUpdates {
-			if m.updateCheck.RepoBehind > 0 {
-				lines = append(lines, m.styles.Warning.Render(fmt.Sprintf("• Repo: %d commit(s) behind (run 'anx upgrade')", m.updateCheck.RepoBehind)))
-			}
-			if m.updateCheck.ConfigDrifts > 0 {
-				lines = append(lines, m.styles.Warning.Render(fmt.Sprintf("• Drifts: %d configuration drift(s) (run 'anx sync')", m.updateCheck.ConfigDrifts)))
-			}
-		} else {
-			lines = append(lines, m.styles.Success.Render("✓ Repository and dotfiles are fully up to date"))
-		}
-	}
-	return BuildPanel(m.styles, lines, w, h, true)
+	return body
 }
 
 func (m Model) renderPackages(w, h int) string {

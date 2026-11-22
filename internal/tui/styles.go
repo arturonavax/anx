@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
@@ -202,4 +203,35 @@ func JoinHorizontal(left, right string, gap int) string {
 	}
 
 	return sb.String()
+}
+
+// RenderKeyCap renders a modern keycap hint such as "[Tab] Switch".
+func RenderKeyCap(styles *theme.Styles, key, label string) string {
+	return styles.KeyCap.Render("["+key+"]") + " " + styles.Muted.Render(label)
+}
+
+// RenderProgressGauge renders a compact visual progress bar (e.g., "████████░░ 80%").
+func RenderProgressGauge(styles *theme.Styles, ratio float64, barWidth int) string {
+	if barWidth < 4 {
+		barWidth = 4
+	}
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	filled := int(ratio*float64(barWidth) + 0.5)
+	if filled > barWidth {
+		filled = barWidth
+	}
+	empty := barWidth - filled
+	fillStyle := styles.Success
+	if ratio < 0.5 {
+		fillStyle = styles.Error
+	} else if ratio < 0.85 {
+		fillStyle = styles.Warning
+	}
+	bar := fillStyle.Render(strings.Repeat("█", filled)) + styles.Muted.Render(strings.Repeat("░", empty))
+	return fmt.Sprintf("%s %3d%%", bar, int(ratio*100+0.5))
 }

@@ -13,13 +13,14 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/arturonavax/anx/internal/app"
 	"github.com/arturonavax/anx/internal/catalog"
-	"github.com/arturonavax/anx/internal/testutil"
 	"github.com/arturonavax/anx/internal/domain"
 	"github.com/arturonavax/anx/internal/platform"
 	"github.com/arturonavax/anx/internal/providers"
 	"github.com/arturonavax/anx/internal/security"
 	"github.com/arturonavax/anx/internal/state"
+	"github.com/arturonavax/anx/internal/testutil"
 	"github.com/arturonavax/anx/internal/theme"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func newTestDeps(t *testing.T) Deps {
@@ -1447,3 +1448,188 @@ func TestOrderProfilesForWizard(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestFoxLogoResponsiveTiersAndBounds(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+
+	cases := []struct {
+		name      string
+		width     int
+		height    int
+		wantTier  LogoTier
+		minLines  int
+		maxLines  int
+	}{
+		{name: "large", width: 120, height: 36, wantTier: LogoTierFull, minLines: 6, maxLines: 8},
+		{name: "medium", width: 72, height: 22, wantTier: LogoTierCompact, minLines: 3, maxLines: 3},
+		{name: "small", width: 48, height: 14, wantTier: LogoTierMinimal, minLines: 1, maxLines: 1},
+		{name: "narrow-tall", width: 52, height: 36, wantTier: LogoTierMinimal, minLines: 1, maxLines: 1},
+		{name: "wide-short", width: 120, height: 16, wantTier: LogoTierMinimal, minLines: 1, maxLines: 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SelectLogoTier(tc.width, tc.height); got != tc.wantTier {
+				t.Fatalf("SelectLogoTier(%d, %d) = %v, want %v", tc.width, tc.height, got, tc.wantTier)
+			}
+			rendered := RenderFoxLogo(tc.width, tc.height, 0, false)
+			lines := strings.Split(rendered, "\n")
+			if len(lines) < tc.minLines || len(lines) > tc.maxLines {
+				t.Fatalf("tier %s: got %d lines, want [%d, %d]", tc.name, len(lines), tc.minLines, tc.maxLines)
+			}
+			for i, line := range lines {
+				if w := ansi.StringWidth(line); w > tc.width {
+					t.Fatalf("tier %s line %d exceeds width %d (got %d): %q", tc.name, i, tc.width, w, ansi.Strip(line))
+				}
+			}
+			if !strings.Contains(ansi.Strip(rendered), "ANX") {
+				t.Fatalf("tier %s expected ANX branding in logo, got:\n%s", tc.name, ansi.Strip(rendered))
+			}
+		})
+	}
+}
+
+func TestFoxLogoAnimationAndNoColor(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+
+	f0 := RenderFoxLogo(120, 36, 0, false)
+	f3 := RenderFoxLogo(120, 36, 3, false)
+	if f0 == f3 {
+		t.Fatalf("expected animated fox logo frame 0 and frame 3 to differ when color is enabled")
+	}
+
+	plain0 := RenderFoxLogo(120, 36, 0, true)
+	plain3 := RenderFoxLogo(120, 36, 3, true)
+	if strings.Contains(plain0, "\x1b[") || strings.Contains(plain3, "\x1b[") {
+		t.Fatalf("expected zero ANSI escape codes under noColor=true")
+	}
+	if plain0 != plain3 {
+		t.Fatalf("expected identical clean output across frames under noColor=true")
+	}
+}
+
+func TestDashboardLogoTickAndDynamicHeaderTheme(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	deps := newTestDeps(t)
+	fox := theme.ByName("fox")
+	deps.Theme = &fox
+	deps.Styles = theme.NewStyles(fox)
+
+	m := NewModel(deps)
+	m.SetDimensions(120, 36)
+
+	// Logo tick advances frame and schedules next tick while active
+	nm, cmd := m.Update(logoTickMsg(time.Now()))
+	m = nm.(Model)
+	if m.logoFrame != 1 {
+		t.Fatalf("expected logoFrame to increment to 1, got %d", m.logoFrame)
+	}
+	if cmd == nil {
+		t.Fatalf("expected logoTickMsg to reschedule next tick while active")
+	}
+
+	// Header displays dynamic theme name ("fox"), never hardcoded "Tokyo Night"
+	header := ansi.Strip(m.renderHeader())
+	if !strings.Contains(strings.ToLower(header), "fox") {
+		t.Fatalf("expected dynamic active theme 'fox' in header, got: %q", header)
+	}
+	if strings.Contains(header, "Tokyo Night") {
+		t.Fatalf("expected hardcoded 'Tokyo Night' to be removed from header, got: %q", header)
+	}
+
+	// When quitting, logoTickMsg must not reschedule
+	m.quitting = true
+	_, quitCmd := m.Update(logoTickMsg(time.Now()))
+	if quitCmd != nil {
+		t.Fatalf("expected nil cmd on logoTickMsg when quitting")
+	}
+}
+
+func TestDashboardDynamicMouseTabAndContentHitTesting(t *testing.T) {
+	deps := newTestDeps(t)
+	m := NewModel(deps)
+	m.SetDimensions(120, 36)
+
+	// Every tab's computed X range must select that exact tab on click
+	ranges := m.tabRanges()
+	if len(ranges) != len(TabNames) {
+		t.Fatalf("expected %d tab ranges, got %d", len(TabNames), len(ranges))
+	}
+	tabY := m.tabBarY()
+	for _, r := range ranges {
+		midX := (r.startX + r.endX) / 2
+		nm, _ := m.Update(tea.MouseClickMsg{
+			X:      midX,
+			Y:      tabY,
+			Button: tea.MouseLeft,
+		})
+		curr := nm.(Model)
+		if curr.ActiveTab() != r.tab {
+			t.Fatalf("click at (%d,%d) selected %v, want %v", midX, tabY, curr.ActiveTab(), r.tab)
+		}
+	}
+
+	// Dynamic contentStartY adapts per tab's inner header line count
+	m.activeTab = TabPackages
+	pkgStartY := m.contentStartY()
+	m.activeTab = TabHacks
+	hacksStartY := m.contentStartY()
+	if hacksStartY <= pkgStartY {
+		t.Fatalf("expected TabHacks contentStartY (%d) > TabPackages contentStartY (%d)", hacksStartY, pkgStartY)
+	}
+}
+
+func TestDashboardViewsRenderAcrossSizesWithoutOverflow(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	deps := newTestDeps(t)
+	fox := theme.ByName("fox")
+	deps.Theme = &fox
+	deps.Styles = theme.NewStyles(fox)
+
+	sizes := [][2]int{
+		{120, 36},
+		{72, 22},
+		{48, 14},
+	}
+
+	for _, sz := range sizes {
+		m := NewModel(deps)
+		m.SetDimensions(sz[0], sz[1])
+		for tab := TabOverview; tab <= TabSecurity; tab++ {
+			m.activeTab = tab
+			v := m.View().Content
+			if strings.TrimSpace(v) == "" {
+				t.Fatalf("empty view for tab %v at %dx%d", tab, sz[0], sz[1])
+			}
+			for i, line := range strings.Split(v, "\n") {
+				if w := ansi.StringWidth(line); w > sz[0] {
+					t.Fatalf("tab %v at %dx%d line %d width %d > %d: %q", tab, sz[0], sz[1], i, w, sz[0], ansi.Strip(line))
+				}
+			}
+		}
+	}
+}
+
+func TestWizardAnimatedFoxHeaderAndWelcome(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	deps := newTestDeps(t)
+	wiz := NewWizardModel(deps.Platform, deps.Catalog, nil)
+	wiz.width = 110
+	wiz.height = 34
+
+	if cmd := wiz.Init(); cmd == nil {
+		t.Fatalf("expected WizardModel.Init() to return animation tick command")
+	}
+
+	nm, cmd := wiz.Update(wizardSpinnerTickMsg(time.Now()))
+	w := nm.(WizardModel)
+	if w.spinnerFrame != 1 || cmd == nil {
+		t.Fatalf("expected wizardSpinnerTickMsg to advance spinnerFrame and reschedule, got frame=%d cmd=%v", w.spinnerFrame, cmd)
+	}
+
+	view := w.View().Content
+	if !strings.Contains(ansi.Strip(view), "ANX SETUP WIZARD") {
+		t.Fatalf("expected ANX SETUP WIZARD in wizard view")
+	}
+}
+

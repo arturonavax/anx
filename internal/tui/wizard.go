@@ -423,7 +423,7 @@ func NewWizardModel(
 
 // Init implements tea.Model.
 func (w WizardModel) Init() tea.Cmd {
-	return nil
+	return tickSpinnerCmd()
 }
 
 // Update handles keyboard and window resize events in the wizard.
@@ -847,11 +847,11 @@ func (w WizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return w, nil
 
 	case wizardSpinnerTickMsg:
-		if w.stage == StageApplying || w.stage == StagePlanning {
-			w.spinnerFrame++
-			return w, tickSpinnerCmd()
+		if w.quitting {
+			return w, nil
 		}
-		return w, nil
+		w.spinnerFrame++
+		return w, tickSpinnerCmd()
 
 	case tea.WindowSizeMsg:
 		w.width = msg.Width
@@ -1385,11 +1385,18 @@ func (w WizardModel) View() tea.View {
 		return tea.NewView("")
 	}
 
-	header := w.styles.Header.Render("  ANX SETUP WIZARD  ") + w.styles.Muted.Render(" — Interactive Component Interview")
+	noColor := theme.IsNoColor() || (w.styles != nil && w.styles.Palette.Name == theme.NoColorPalette.Name)
+	badge := RenderFoxBadge(w.spinnerFrame, noColor)
+	header := fmt.Sprintf(" %s  %s%s",
+		badge,
+		w.styles.Header.Render("ANX SETUP WIZARD"),
+		w.styles.Muted.Render(" — Interactive Component Interview"),
+	)
 	availWidth := w.width
 	if availWidth < 50 {
 		availWidth = 50
 	}
+	header = ansi.Truncate(header, availWidth, "…")
 	availHeight := w.height - 4
 	if availHeight < 6 {
 		availHeight = 6
@@ -1421,10 +1428,21 @@ func (w WizardModel) View() tea.View {
 }
 
 func (w WizardModel) renderSelectProfile(width int) string {
-	lines := []string{
+	noColor := theme.IsNoColor() || (w.styles != nil && w.styles.Palette.Name == theme.NoColorPalette.Name)
+	lines := make([]string, 0, 24)
+	if w.height >= 24 && width >= 60 {
+		logoH := w.height
+		if w.height < 30 {
+			logoH = 20 // Compact crest when vertical space is moderate
+		}
+		logo := RenderFoxLogo(width-2, logoH, w.spinnerFrame, noColor)
+		lines = append(lines, strings.Split(logo, "\n")...)
+		lines = append(lines, "")
+	}
+	lines = append(lines,
 		w.styles.Highlight.Render("STAGE 1/5: SELECT INSTALLATION PROFILE"),
 		"Choose a preset profile matching your machine's primary role:",
-	}
+	)
 	if len(w.matchedHacks) > 0 {
 		hackNames := make([]string, 0, len(w.matchedHacks))
 		for _, hk := range w.matchedHacks {

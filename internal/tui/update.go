@@ -38,6 +38,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusMsg = string(msg)
 		return m, nil
 
+	case logoTickMsg:
+		if m.quitting {
+			return m, nil
+		}
+		m.logoFrame++
+		return m, tickLogoCmd()
+
 	case errMsg:
 		m.statusMsg = "Error: " + msg.err.Error()
 		return m, nil

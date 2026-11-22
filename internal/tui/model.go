@@ -49,6 +49,7 @@ type Model struct {
 	updateCheck              *UpdateCheckResult
 	showHelp                 bool
 	statusMsg                string
+	logoFrame                int
 	quitting                 bool
 }
 
@@ -193,12 +194,30 @@ func NewModel(deps Deps) Model {
 func (m Model) Init() tea.Cmd {
 	ctx := context.Background()
 	return tea.Batch(
+		tickLogoCmd(),
 		loadDoctorCmd(ctx, m.deps.Doctor),
 		loadAuditCmd(ctx, m.deps.Audit),
 		loadSystemAuditCmd(ctx, m.deps.Audit, m.securityProfile),
 		loadHacksCmd(ctx, m.deps.Hacks),
 		loadUpdateCheckCmd(ctx, m.deps.RepoRoot, m.deps.Sync),
 	)
+}
+
+func (m Model) isNoColor() bool {
+	if theme.IsNoColor() {
+		return true
+	}
+	return m.styles != nil && m.styles.Palette.Name == theme.NoColorPalette.Name
+}
+
+func (m Model) effectiveWidth() int {
+	if m.width <= 0 {
+		return 80
+	}
+	if m.width < 20 {
+		return 20
+	}
+	return m.width
 }
 
 // ActiveTab returns the currently displayed tab index.

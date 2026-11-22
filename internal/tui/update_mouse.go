@@ -1,12 +1,21 @@
 package tui
 
 import (
+	"strings"
+
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
+type tabRange struct {
+	tab    TabID
+	startX int
+	endX   int
+}
+
 // handleMouse implements mouse handling adhering strictly to Golden Rule #3:
-// - Uses X coordinates for horizontal tab bar and side-by-side dual-pane panels
-// - Uses Y coordinates for vertical list item selection
+// - Uses dynamically computed X ranges for horizontal tab bar and dual-pane panels
+// - Uses dynamically computed Y offsets for vertical list item selection
 func (m Model) handleMouse(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.MouseClickMsg:
@@ -14,10 +23,10 @@ func (m Model) handleMouse(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Row 1 is the horizontal Tab bar -> Use X coordinates to switch tabs
-		if msg.Y == 1 {
+		// Tab bar row -> Use dynamically computed X ranges to switch tabs
+		if msg.Y == m.tabBarY() {
 			tabIdx := m.calculateTabFromX(msg.X)
-			if tabIdx >= 0 && tabIdx < 8 {
+			if tabIdx >= 0 && tabIdx < len(TabNames) {
 				m.activeTab = TabID(tabIdx)
 				m.selectedIdx = 0
 				m.scrollOffset = 0
@@ -25,8 +34,8 @@ func (m Model) handleMouse(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Content rows (msg.Y >= 2)
-		if m.isWideLayout() {
+		// Content rows below tab bar
+		if msg.Y > m.tabBarY() && m.isWideLayout() {
 			// Side-by-side mode: use X coordinates to focus panel
 			leftWidth, _ := m.calculateDualPaneWidths()
 			if msg.X < leftWidth {
@@ -51,8 +60,7 @@ func (m Model) handleMouse(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Vertical list selection: use relative Y coordinate + scrollOffset
-		// Header (row 0) + Tabs (row 1) + Panel top border (row 2) + Panel headerLine (row 3) -> Items start at row 4
-		contentStartY := 4
+		contentStartY := m.contentStartY()
 		relY := msg.Y - contentStartY
 		if relY >= 0 {
 			targetIdx := m.scrollOffset + relY
@@ -81,28 +89,67 @@ func (m Model) handleMouse(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// calculateTabFromX matches horizontal tab clicks to TabID (Golden Rule #3).
-func (m Model) calculateTabFromX(x int) int {
-	// Approximate character ranges for:
-	// " 1:Overview  2:Packages  3:Configs  4:AI  5:Hacks  6:Doctor  7:History  8:Security "
-	switch {
-	case x < 13:
-		return int(TabOverview)
-	case x < 25:
-		return int(TabPackages)
-	case x < 36:
-		return int(TabConfigs)
-	case x < 44:
-		return int(TabAI)
-	case x < 54:
-		return int(TabHacks)
-	case x < 65:
-		return int(TabDoctor)
-	case x < 77:
-		return int(TabHistory)
+// tabBarY computes the 0-based Y row of the tab bar from the actual rendered header height.
+func (m Model) tabBarY() int {
+	header := m.renderHeader()
+	return len(strings.Split(header, "\n"))
+}
+
+// contentStartY computes the 0-based Y row where scrollable list items begin
+// based on the actual rendered header, tab bar, top border, and active tab's inner header rows.
+func (m Model) contentStartY() int {
+	headerLines := len(strings.Split(m.renderHeader(), "\n"))
+	tabsLines := len(strings.Split(m.renderTabs(), "\n"))
+	const topBorderLine = 1
+	return headerLines + tabsLines + topBorderLine + m.panelHeaderLineCount()
+}
+
+func (m Model) panelHeaderLineCount() int {
+	switch m.activeTab {
+	case TabPackages, TabConfigs, TabDoctor:
+		return 1
+	case TabHacks:
+		return 3
+	case TabSecurity:
+		if m.isWideLayout() {
+			return 6
+		}
+		return 2
 	default:
-		return int(TabSecurity)
+		return 1
 	}
+}
+
+// tabRanges computes the exact [startX, endX) column bounds for each rendered tab pill.
+func (m Model) tabRanges() []tabRange {
+	ranges := make([]tabRange, 0, len(TabNames))
+	cursor := 1 // leading single space in renderTabs
+	for i, name := range TabNames {
+		var rendered string
+		if TabID(i) == m.activeTab {
+			rendered = m.styles.TabActive.Render(name)
+		} else {
+			rendered = m.styles.TabInactive.Render(name)
+		}
+		w := ansi.StringWidth(rendered)
+		ranges = append(ranges, tabRange{
+			tab:    TabID(i),
+			startX: cursor,
+			endX:   cursor + w,
+		})
+		cursor += w + 1 // trailing single space separator
+	}
+	return ranges
+}
+
+// calculateTabFromX matches horizontal tab clicks to TabID using actual rendered tab widths (Golden Rule #3).
+func (m Model) calculateTabFromX(x int) int {
+	for _, r := range m.tabRanges() {
+		if x >= r.startX && x < r.endX {
+			return int(r.tab)
+		}
+	}
+	return -1
 }
 
 // isWideLayout checks if the terminal is wide enough for side-by-side panels.
@@ -112,7 +159,7 @@ func (m Model) isWideLayout() bool {
 
 // calculateDualPaneWidths computes weights-based panel widths (Golden Rule #4).
 func (m Model) calculateDualPaneWidths() (int, int) {
-	availWidth := m.width
+	availWidth := m.effectiveWidth()
 	if availWidth < 40 {
 		availWidth = 40
 	}
