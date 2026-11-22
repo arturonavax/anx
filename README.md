@@ -30,6 +30,12 @@ sh ./install.sh --install-only
 
 Configuration repositories can run scripts too; use only repositories you trust.
 
+To clone and link an environment, run `anx repo clone <url>`. The default
+checkout is `~/.local/share/anx/env`, regardless of the remote repository name.
+This is separate from the ANX source checkout used by the installer. Existing
+linked environments stay where they are. To switch remotes without replacing a
+checkout, use `anx repo clone <url> --dir <new-path>`.
+
 The bootstrap does not install GVM or Homebrew automatically. When Go is
 missing, it can use an existing GVM or native package manager. To avoid
 automatic toolchain setup, install Go first and build from source.

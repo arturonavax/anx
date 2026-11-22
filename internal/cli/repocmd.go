@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
+	"github.com/arturonavax/anx/internal/bootstrap"
 	"github.com/arturonavax/anx/internal/catalog"
 	"github.com/arturonavax/anx/internal/domain"
 	"github.com/arturonavax/anx/internal/gittransport"
@@ -208,7 +209,8 @@ func newRepoCloneCmd(appCtx *AppContext) *cobra.Command {
 		Use:   "clone [url]",
 		Short: "Clone a remote configuration repository and link it to anx",
 		Long: `Clones a Git configuration repository using automatic SSH discovery with HTTPS fallback.
-Defaults to 'https://github.com/arturonavax/env' (or ANX_CONFIG_REPO) into '~/.local/share/anx/repo'.`,
+Defaults to 'https://github.com/arturonavax/env' (or ANX_CONFIG_REPO) into '~/.local/share/anx/env'.
+Use --dir for another checkout. Existing files are never overwritten.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			explicit := ""
@@ -225,21 +227,23 @@ Defaults to 'https://github.com/arturonavax/env' (or ANX_CONFIG_REPO) into '~/.l
 
 			dest := targetDir
 			if dest == "" {
-				dest = filepath.Join(appCtx.Platform.HomeDir(), ".local", "share", "anx", "repo")
+				dest = bootstrap.ManagedEnvironmentDir(appCtx.Platform.HomeDir())
 			}
 			dest = appCtx.Platform.ExpandPath(dest)
 
-			if isDir(filepath.Join(dest, "manifests")) || isDir(filepath.Join(dest, "files")) {
-				fmt.Fprintf(cmd.OutOrStdout(), "Repository already exists at %s.\n", dest)
-				return linkRepoRoot(appCtx, dest, repoURL, chosenRef, cmd.OutOrStdout())
+			if err := checkCheckoutDestination(dest); err != nil {
+				return err
 			}
 
+			source := gittransport.NormalizeURL(repoURL).Redacted
 			if appCtx.Flags.DryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "dry-run: would clone %s (ref=%q, auth=%s) into %s (depth: %d)\n", repoURL, chosenRef, mode, dest, depth)
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"dry-run: would clone %s (ref=%q, auth=%s) into %s (depth: %d)\n",
+					source, chosenRef, mode, dest, depth)
 				return nil
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "Cloning configuration repository from %s into %s...\n", gittransport.NormalizeURL(repoURL).Redacted, dest)
+			fmt.Fprintf(cmd.OutOrStdout(), "Cloning configuration repository from %s into %s...\n", source, dest)
 			adapter := newGitAdapter()
 			probe, err := adapter.Clone(cmd.Context(), gittransport.CloneOptions{
 				URL:    repoURL,
@@ -260,7 +264,7 @@ Defaults to 'https://github.com/arturonavax/env' (or ANX_CONFIG_REPO) into '~/.l
 		},
 	}
 
-	cmd.Flags().StringVar(&targetDir, "dir", "", "Target destination directory for cloned repository (default: ~/.local/share/anx/repo)")
+	cmd.Flags().StringVar(&targetDir, "dir", "", "Target destination directory (default: ~/.local/share/anx/env)")
 	cmd.Flags().IntVar(&depth, "depth", 1, "Shallow clone depth (0 for full history)")
 	cmd.Flags().StringVar(&ref, "ref", "", "Branch, tag, or commit to checkout")
 	cmd.Flags().StringVar(&authMode, "auth", "auto", "Git authentication mode (auto|ssh|https)")
@@ -278,7 +282,9 @@ func newRepoSetCmd(appCtx *AppContext) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "set <path-or-url>",
 		Short: "Switch the active configuration repository to a local directory or Git URL",
-		Args:  cobra.ExactArgs(1),
+		Long: `Link a local directory or clone a remote configuration repository into ~/.local/share/anx/env.
+If the checkout already exists, use 'anx repo clone <url> --dir <new-path>' to switch without replacing it.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			raw := strings.TrimSpace(args[0])
 			chosenRef := resolveConfigRef(appCtx, ref)
@@ -290,16 +296,13 @@ func newRepoSetCmd(appCtx *AppContext) *cobra.Command {
 				if err != nil {
 					return domain.NewExitError(domain.ExitUsageError, err)
 				}
-				dest := filepath.Join(appCtx.Platform.HomeDir(), ".local", "share", "anx", "repo")
+				dest := bootstrap.ManagedEnvironmentDir(appCtx.Platform.HomeDir())
+				if err := checkCheckoutDestination(dest); err != nil {
+					return err
+				}
 				if appCtx.Flags.DryRun {
 					fmt.Fprintf(cmd.OutOrStdout(), "dry-run: would switch config repo to %s (dest: %s)\n", norm.Redacted, dest)
 					return nil
-				}
-				// Clone into a fresh target directory if switching URLs
-				if isDir(dest) {
-					if err := os.RemoveAll(dest); err != nil {
-						return fmt.Errorf("clearing previous repo cache %s: %w", dest, err)
-					}
 				}
 				adapter := newGitAdapter()
 				probe, err := adapter.Clone(cmd.Context(), gittransport.CloneOptions{
@@ -548,7 +551,7 @@ func ensureDotfilesRepo(cmd *cobra.Command, appCtx *AppContext) error {
 		return nil
 	}
 
-	targetDir := filepath.Join(appCtx.Platform.HomeDir(), ".local", "share", "anx", "repo")
+	targetDir := bootstrap.ManagedEnvironmentDir(appCtx.Platform.HomeDir())
 	defaultURL := resolveConfigRepoURL(appCtx, "")
 	chosenRef := resolveConfigRef(appCtx, "")
 
@@ -579,6 +582,9 @@ func ensureDotfilesRepo(cmd *cobra.Command, appCtx *AppContext) error {
 		)
 	}
 
+	if err := checkCheckoutDestination(targetDir); err != nil {
+		return err
+	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Cloning configuration repository into %s...\n", targetDir)
 	adapter := newGitAdapter()
 	probe, err := adapter.Clone(cmd.Context(), gittransport.CloneOptions{
@@ -594,4 +600,32 @@ func ensureDotfilesRepo(cmd *cobra.Command, appCtx *AppContext) error {
 	}
 
 	return linkRepoRoot(appCtx, targetDir, probe.Normalized.Redacted, chosenRef, cmd.OutOrStdout())
+}
+
+func checkCheckoutDestination(dest string) error {
+	info, err := os.Lstat(dest)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspecting checkout destination %q: %w", dest, err)
+	}
+	if info.IsDir() {
+		dir, err := os.Open(dest)
+		if err != nil {
+			return fmt.Errorf("opening checkout destination %q: %w", dest, err)
+		}
+		defer dir.Close()
+		_, err = dir.Readdirnames(1)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("reading checkout destination %q: %w", dest, err)
+		}
+	}
+	return domain.NewExitError(domain.ExitUsageError, fmt.Errorf(
+		"checkout destination %q is not an empty directory; use 'anx repo clone <url> --dir <new-path>' to keep existing files",
+		dest,
+	))
 }

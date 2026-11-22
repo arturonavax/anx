@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -95,6 +96,115 @@ profiles:
 
 type fakeCLIGitRunner struct {
 	fn func(ctx context.Context, env []string, dir string, name string, args ...string) (string, string, error)
+}
+
+func TestCLIManagedEnvironmentCheckout(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Setenv("ANX_CONFIG_REPO", "")
+	t.Setenv("ANX_REPO", "")
+	t.Setenv("REPO_ROOT", "")
+	t.Setenv("ANX_SSH_KEY", "")
+
+	dest := filepath.Join(home, ".local", "share", "anx", "env")
+	marker := filepath.Join(dest, "manifests", "uncommitted.yaml")
+	engine := filepath.Join(home, ".local", "share", "anx", "repo", "engine-marker")
+	if err := os.MkdirAll(filepath.Dir(engine), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(engine, []byte("engine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repoURL := "https://github.com/example-org/different-name"
+	var clones int
+	restore := cli.SetGitAdapterFactoryForTest(func() *gittransport.Adapter {
+		return &gittransport.Adapter{Runner: fakeCLIGitRunner{fn: func(
+			_ context.Context, _ []string, _, _ string, args ...string,
+		) (string, string, error) {
+			switch args[0] {
+			case "ls-remote":
+				return "cafebabe\tHEAD\n", "", nil
+			case "clone":
+				clones++
+				if args[len(args)-2] != "git@github.com:example-org/different-name.git" {
+					t.Errorf("expected SSH clone, got %v", args)
+				}
+				if got := args[len(args)-1]; got != dest {
+					return "", "", errors.New("clone targeted " + got + " instead of " + dest)
+				}
+				return "", "", os.MkdirAll(filepath.Dir(marker), 0o755)
+			default:
+				return "", "", errors.New("unexpected Git command " + args[0])
+			}
+		}}}
+	})
+	defer restore()
+
+	run := func(args ...string) (int, string, string) {
+		var out, errOut bytes.Buffer
+		code := cli.ExecuteCLI(args, &out, &errOut, "2.0.0-test", "", "")
+		return code, out.String(), errOut.String()
+	}
+	code, out, stderr := run("repo", "clone", repoURL, "--dry-run")
+	if code != 0 || !strings.Contains(out, dest) || clones != 0 {
+		t.Errorf("dry-run: exit=%d clones=%d stdout=%q stderr=%q", code, clones, out, stderr)
+	}
+	code, out, stderr = run("repo", "clone", repoURL)
+	if code != 0 || !strings.Contains(out, "Linked configuration repository: "+dest) || clones != 1 {
+		t.Errorf("clone: exit=%d clones=%d stdout=%q stderr=%q", code, clones, out, stderr)
+	}
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("# local changes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	otherURL := "https://github.com/example-org/other"
+	for _, action := range []string{"clone", "set"} {
+		code, out, stderr = run("repo", action, otherURL)
+		if code == 0 || !strings.Contains(stderr, dest) || clones != 1 {
+			t.Errorf("%s: exit=%d clones=%d stdout=%q stderr=%q", action, code, clones, out, stderr)
+		}
+	}
+	for _, kind := range []string{"file", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			target := filepath.Join(home, kind)
+			if kind == "symlink" {
+				if err := os.Symlink(dest, target); err != nil {
+					if runtime.GOOS == "windows" {
+						t.Skipf("cannot create a symlink on this Windows host: %v", err)
+					}
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(target, []byte("unrelated"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			code, out, stderr := run("repo", "clone", otherURL, "--dir", target)
+			if code != 2 || !strings.Contains(stderr, "not an empty directory") || clones != 1 {
+				t.Errorf("exit=%d clones=%d stdout=%q stderr=%q", code, clones, out, stderr)
+			}
+			if kind == "symlink" {
+				if destination, err := os.Readlink(target); err != nil || destination != dest {
+					t.Errorf("symlink changed: destination=%q err=%v", destination, err)
+				}
+			} else if data, err := os.ReadFile(target); err != nil || string(data) != "unrelated" {
+				t.Errorf("file changed: contents=%q err=%v", data, err)
+			}
+		})
+	}
+	for path, want := range map[string]string{engine: "engine", marker: "# local changes\n"} {
+		if data, err := os.ReadFile(path); err != nil || string(data) != want {
+			t.Errorf("%s changed: contents=%q err=%v", path, data, err)
+		}
+	}
+	code, out, stderr = run("repo", "status", "--format", "json")
+	if code != 0 || !strings.Contains(out, "different-name") || strings.Contains(out, "example-org/other") {
+		t.Errorf("status after attempted switch: exit=%d stdout=%q stderr=%q", code, out, stderr)
+	}
 }
 
 func (f fakeCLIGitRunner) Run(ctx context.Context, env []string, dir string, name string, args ...string) (string, string, error) {

@@ -73,6 +73,34 @@ func TestResolveRepoRoot(t *testing.T) {
 	}
 }
 
+func TestResolveRepoRootPrefersManagedEnvironmentAndKeepsLegacy(t *testing.T) {
+	home := t.TempDir()
+	t.Chdir(t.TempDir())
+	for _, key := range []string{"ANX_CONFIG_REPO", "ANX_REPO", "REPO_ROOT"} {
+		t.Setenv(key, "")
+	}
+	legacy := filepath.Join(home, ".local", "share", "anx", "repo")
+	for _, dir := range []string{"manifests", "files"} {
+		if err := os.MkdirAll(filepath.Join(legacy, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := bootstrap.ResolveRepoRoot("", home, ""); got != legacy {
+		t.Fatalf("expected legacy environment %q before new checkout, got %q", legacy, got)
+	}
+
+	dest := filepath.Join(home, ".local", "share", "anx", "env")
+	if err := os.MkdirAll(filepath.Join(dest, "manifests"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := bootstrap.ResolveRepoRoot("", home, ""); got != dest {
+		t.Errorf("expected managed environment %q, got %q", dest, got)
+	}
+	if got := bootstrap.ResolveRepoRoot("", home, legacy); got != legacy {
+		t.Errorf("expected existing linked environment %q to remain linked, got %q", legacy, got)
+	}
+}
+
 func TestMacOSFreshBookBootstrapWithoutCLT(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell bootstrap test skipped on Windows")

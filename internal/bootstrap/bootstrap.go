@@ -324,6 +324,11 @@ func NewContainer(opts ...Option) (*Container, error) {
 	}, nil
 }
 
+// ManagedEnvironmentDir is the default checkout for a configuration repository.
+func ManagedEnvironmentDir(home string) string {
+	return filepath.Join(home, ".local", "share", "anx", "env")
+}
+
 // ResolveRepoRoot finds the env repository: configured path, env vars, walking up from cwd, persisted store root, or well-known user paths.
 func ResolveRepoRoot(configured, home, stored string) string {
 	if configured != "" && isDir(filepath.Join(configured, "manifests")) {
@@ -351,6 +356,9 @@ func ResolveRepoRoot(configured, home, stored string) string {
 	}
 	if stored != "" && isDir(filepath.Join(stored, "files")) && isDir(filepath.Join(stored, "manifests")) {
 		return stored
+	}
+	if managed := ManagedEnvironmentDir(home); isDir(filepath.Join(managed, "manifests")) {
+		return managed
 	}
 	candidates := []string{
 		"/repo",
