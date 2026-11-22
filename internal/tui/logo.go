@@ -95,7 +95,7 @@ func RenderFoxLogo(width, height, frame int, noColor bool) string {
 // RenderFoxBadge renders a sleek single-line animated Fox emblem for headers.
 func RenderFoxBadge(frame int, noColor bool) string {
 	plain := noColor || theme.IsNoColor()
-	mark := `/\_/\`
+	mark := `◢◤▲◥◣`
 	if plain {
 		return mark
 	}
@@ -105,17 +105,19 @@ func RenderFoxBadge(frame int, noColor bool) string {
 func renderFullFoxHero(frame int, plain bool) []string {
 	eyeRune := '◈'
 	if !plain && (frame%8 == 0 || frame%8 == 1) {
-		eyeRune = '◆'
+		eyeRune = '✦'
 	}
 
+	// Low-poly geometric Fox silhouette (8 lines x 21 cells).
 	foxArt := []string{
-		`  /\           /\  `,
-		` /  \   ___   /  \ `,
-		`/ /\ \_/   \_/ /\ \`,
-		`\ \   ` + string(eyeRune) + `     ` + string(eyeRune) + `   / /`,
-		` \ \     ▼     / / `,
-		`  \ \___/ \___/ /  `,
-		`   \____\_/____/   `,
+		`  ◢◣             ◢◣  `,
+		` ◢█▀◣           ◢▀█◣ `,
+		`◢█▀ ▀◣ ▄▄▄▄▄▄▄ ◢▀ ▀█◣`,
+		`█▌  ◢███████████◣  ▐█`,
+		`◥█◣ ▐█ ` + string(eyeRune) + `  ▄  ` + string(eyeRune) + ` █▌ ◢█◤`,
+		` ◥██◣◥████▀████◤◢██◤ `,
+		`   ◥██◣  ◥▼◤  ◢██◤   `,
+		`     ◥████▄████◤     `,
 	}
 
 	wordmark := []string{
@@ -124,6 +126,7 @@ func renderFullFoxHero(frame int, plain bool) []string {
 		`███████║██╔██╗ ██║ ╚███╔╝ `,
 		`██╔══██║██║╚██╗██║ ██╔██╗ `,
 		`██║  ██║██║ ╚████║██╔╝ ██╗`,
+		`╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝`,
 		`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
 		`ANX · DEVELOPER ENVIRONMENT ORCHESTRATOR`,
 	}
@@ -149,31 +152,34 @@ func renderFullFoxHero(frame int, plain bool) []string {
 func renderCompactFoxCrest(frame int, plain bool) []string {
 	eyeRune := '◈'
 	if !plain && (frame%8 == 0 || frame%8 == 1) {
-		eyeRune = '◆'
+		eyeRune = '✦'
 	}
 
+	// Compact low-poly Fox crest (4 lines x 13 cells).
 	foxLines := []string{
-		` /\_/\ `,
-		`(` + string(eyeRune) + `   ` + string(eyeRune) + `)`,
-		` \ ▼ / `,
+		` ◢◣       ◢◣ `,
+		`◢█▀◣▄▄▄▄▄◢▀█◣`,
+		`◥█ ` + string(eyeRune) + `  ▄  ` + string(eyeRune) + ` █◤`,
+		`  ◥██◥▼◤██◤  `,
 	}
 	rightLines := []string{
 		`▄▀█ █▄░█ ▀▄▀  ANX`,
 		`█▀█ █░▀█ █░█  Environment Orchestrator`,
 		`━━━━━━━━━━━━  Burgundy · Crimson · Gold`,
+		`Ready · Cross-Platform · Concurrent`,
 	}
 
 	out := make([]string, len(foxLines))
 	for row := range foxLines {
 		left := renderFoxGradientLine(foxLines[row], row, frame, plain, true)
 		var right string
-		if row == 1 && !plain {
+		switch {
+		case (row == 1 || row == 2) && !plain:
 			parts := strings.SplitN(rightLines[row], "  ", 2)
 			right = renderFoxGradientLine(parts[0], row, frame+2, false, false) + "  " + foxTaglineStyle.Render(parts[1])
-		} else if row == 2 && !plain {
-			parts := strings.SplitN(rightLines[row], "  ", 2)
-			right = renderFoxGradientLine(parts[0], row, frame+2, false, false) + "  " + foxTaglineStyle.Render(parts[1])
-		} else {
+		case row == 3 && !plain:
+			right = foxTaglineStyle.Render(rightLines[row])
+		default:
 			right = renderFoxGradientLine(rightLines[row], row, frame+2, plain, false)
 		}
 		out[row] = left + "  " + right
@@ -182,7 +188,7 @@ func renderCompactFoxCrest(frame int, plain bool) []string {
 }
 
 func renderMinimalFoxEmblem(frame int, plain bool) string {
-	emblem := `/\_/\ ANX`
+	emblem := `◢◤▲◥◣ ANX`
 	if plain {
 		return emblem
 	}
@@ -209,7 +215,7 @@ func renderFoxGradientLine(line string, row, frame int, plain, accentFace bool) 
 		}
 		if accentFace {
 			switch r {
-			case '◆':
+			case '✦', '◆':
 				sb.WriteString(foxEyeGlintStyle.Render(string(r)))
 				col++
 				continue
