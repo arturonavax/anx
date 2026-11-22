@@ -221,6 +221,10 @@ if [ "$1" = "version" ]; then
   echo "go version go1.27.3 darwin/arm64"
   exit 0
 fi
+if [ "$1" = "run" ] && [ "$2" = "./internal/buildversion/cmd" ] && [ "$3" = "-ldflags" ]; then
+  echo '-s -w -X main.Version=1.0.0-dev.0'
+  exit 0
+fi
 if [ "$1" = "build" ]; then
   out=""
   prev=""
@@ -273,6 +277,10 @@ exit 1
 		writeStub("go", `#!/bin/sh
 if [ "$1" = "version" ]; then
   echo "go version go1.27.3 darwin/arm64"
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "./internal/buildversion/cmd" ] && [ "$3" = "-ldflags" ]; then
+  echo '-s -w -X main.Version=1.0.0-dev.0'
   exit 0
 fi
 if [ "$1" = "build" ]; then
@@ -368,6 +376,10 @@ cd .
 		writeStub("go", `#!/bin/sh
 if [ "$1" = "version" ]; then
   echo "go version go1.27.3 darwin/arm64"
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "./internal/buildversion/cmd" ] && [ "$3" = "-ldflags" ]; then
+  echo '-s -w -X main.Version=1.0.0-dev.0'
   exit 0
 fi
 if [ "$1" = "build" ]; then

@@ -39,6 +39,24 @@ go install ./cmd/anx
 
 The standalone Windows PowerShell installer is experimental.
 
+## Versioning
+
+`make version` reports the reproducible development version. `make version-next`
+prints the proposed [SemVer](https://semver.org/) stable number without creating
+a tag or release. The calculator starts at the checked-in 1.0.0 checkpoint
+and replays first-parent commits in order. Each `fix` or `perf` increments patch,
+`feat` increments minor, and a conventional `!` or `BREAKING CHANGE:` footer
+increments major. Other commits still advance the development commit count.
+Existing tags do not change the calculation.
+
+`make build` and both source bootstraps use the same calculator. Development
+builds carry a commit and mark dirty worktrees. Source archives and incomplete
+histories use a development fallback; they cannot compute a stable version.
+Plain local `go build`/`go install` may report `dev`; versioned Go module installs
+retain Go's module metadata. Use complete history to plan a release. Before
+publishing a new major version, verify Go module path and installation
+compatibility. Planning a version never performs a release action.
+
 ## Key Commands
 
 ```sh

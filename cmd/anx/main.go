@@ -11,11 +11,11 @@ import (
 
 var (
 	// Version is injected at build time via -ldflags "-X main.Version=...".
-	Version = "1.0.0"
+	Version string
 	// Commit is injected at build time via -ldflags "-X main.Commit=...".
 	Commit = "dev"
 	// Date is injected at build time via -ldflags "-X main.Date=...".
-	Date = "2026-10-29"
+	Date string
 )
 
 func main() {

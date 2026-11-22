@@ -256,21 +256,16 @@ if (-not (Test-Path $anxInstalled)) {
     Write-Step "Building ANX binary for Windows..."
     Push-Location $RepoRoot
     try {
-        $ver = "1.0.0"
-        $commit = "dev"
-        $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
-
-        if (Get-Command "git" -ErrorAction SilentlyContinue) {
-            $gVer = (& git describe --tags --always 2>$null)
-            if ($gVer) { $ver = $gVer }
-            $gCommit = (& git rev-parse --short HEAD 2>$null)
-            if ($gCommit) { $commit = $gCommit }
+        $ldflags = (& go run ./internal/buildversion/cmd -ldflags)
+        if ($LASTEXITCODE -ne 0 -or -not $ldflags) {
+            throw "Could not resolve source build metadata."
         }
 
         $anxExe = Join-Path $DestDir "anx.exe"
         $safeSuspendExe = Join-Path $DestDir "safe-suspend.exe"
 
-        & go build -ldflags "-s -w -X main.Version=$ver -X main.Commit=$commit -X main.Date=$date" -o $anxExe .\cmd\anx
+        & go build -ldflags $ldflags -o $anxExe .\cmd\anx
+        if ($LASTEXITCODE -ne 0) { throw "Could not build ANX from source." }
         Copy-Item $anxExe $safeSuspendExe -Force
         Remove-Item (Join-Path $DestDir "aitools.exe") -ErrorAction SilentlyContinue
         Write-Success "Built $anxExe (alias: safe-suspend.exe)"

@@ -512,24 +512,14 @@ ensure_go_runtime() {
 # ------------------------------------------------------------------------------
 build_anx() {
 	log_step "Compiling ANX platform binary..."
-	local version commit date
-	version="1.0.0"
-	commit="dev"
-	if [[ -d "${REPO_ROOT}/.git" ]] && has_usable_git; then
-		version=$(git -C "${REPO_ROOT}" describe --tags --always 2>/dev/null || echo "1.0.0")
-		commit=$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "dev")
-	fi
-	date=$(date -u "+%Y-%m-%d")
-
+	local ldflags
 	(
 		cd "${REPO_ROOT}"
 		if [[ "$(uname -s)" == "Darwin" ]] && ! has_macos_clt; then
-			CGO_ENABLED=0 go build -ldflags "-s -w -X main.Version=${version} -X main.Commit=${commit} -X main.Date=${date}" \
-				-o "${DEST_BIN}/anx" ./cmd/anx
-		else
-			go build -ldflags "-s -w -X main.Version=${version} -X main.Commit=${commit} -X main.Date=${date}" \
-				-o "${DEST_BIN}/anx" ./cmd/anx
+			export CGO_ENABLED=0
 		fi
+		ldflags="$(go run ./internal/buildversion/cmd -ldflags)" || return 1
+		go build -ldflags "${ldflags}" -o "${DEST_BIN}/anx" ./cmd/anx
 	)
 
 	# Multicall compatibility symlinks

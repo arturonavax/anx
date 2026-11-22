@@ -17,3 +17,9 @@ sh -n install.sh
 bash -n scripts/bootstrap_anx.sh
 node --test deploy/cloudflare/src/index.test.js
 ```
+
+## Versioning
+
+- Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/): `fix` and `perf` advance PATCH, `feat` advances MINOR, and `!` or a `BREAKING CHANGE:` footer advances MAJOR. Other types do not change the stable version.
+- Do not edit version literals for ordinary changes. Use `make version` for a source build and `make version-next` for the proposed stable version. The calculator replays first-parent commits since its checked-in checkpoint, so classify squash and merge commits for the changes they deliver.
+- Do not create tags, publish releases, or change the Go module path implicitly. See [Versioning in the README](README.md#versioning).

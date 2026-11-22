@@ -6,14 +6,22 @@
 .DEFAULT_GOAL := help
 .PHONY: help build install test test-go test-e2e test-unit test-integration lint check wizard plan dry-run uninstall-plan backup restore diff sync clean rebuild rebuild-tools optimize optimize-apply anx-plan anx-status anx-doctor
 
-VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo "1.0.0")
-COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "dev")
-DATE    ?= $(shell date -u "+%Y-%m-%d")
-LDFLAGS := -s -w -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.Date=$(DATE)
+BUILD_VERSION := ./internal/buildversion/cmd
+export ANX_BUILD_VERSION := $(VERSION)
+export ANX_BUILD_COMMIT := $(COMMIT)
+export ANX_BUILD_DATE := $(DATE)
+ANX_RUN = flags=$$(go run $(BUILD_VERSION) -ldflags) && go run -ldflags "$$flags" ./cmd/anx
+
+.PHONY: version version-next
+version:
+	@go run $(BUILD_VERSION)
+
+version-next:
+	@go run $(BUILD_VERSION) -next
 
 build:
 	@mkdir -p bin
-	@go build -ldflags "$(LDFLAGS)" -o bin/anx ./cmd/anx
+	@flags=$$(go run $(BUILD_VERSION) -ldflags) && go build -ldflags "$$flags" -o bin/anx ./cmd/anx
 	@ln -sf anx bin/aitools
 	@echo "Built bin/anx and bin/aitools (multicall symlink) successfully."
 
@@ -27,18 +35,20 @@ test-e2e:
 	@./scripts/test_e2e_docker.sh all
 
 anx-plan:
-	@go run -ldflags "$(LDFLAGS)" ./cmd/anx plan
+	@$(ANX_RUN) plan
 
 anx-status:
-	@go run -ldflags "$(LDFLAGS)" ./cmd/anx status
+	@$(ANX_RUN) status
 
 anx-doctor:
-	@go run -ldflags "$(LDFLAGS)" ./cmd/anx doctor
+	@$(ANX_RUN) doctor
 
 help:
 	@echo "arturonavax/anx — Development & Operational Interface"
 	@echo ""
 	@echo "Available Targets:"
+	@echo "  make version           Print the development version for this checkout"
+	@echo "  make version-next      Print the planned stable version (no tag or release)"
 	@echo "  make build             Compile anx and aitools binaries into bin/"
 	@echo "  make install           Bootstrap Go and apply workstation state via anx"
 	@echo "  make test-go           Run full Go unit & race test suite"
@@ -54,13 +64,13 @@ help:
 	@echo ""
 
 optimize:
-	@go run -ldflags "$(LDFLAGS)" ./cmd/anx optimize --report
+	@$(ANX_RUN) optimize --report
 
 optimize-apply:
-	@go run -ldflags "$(LDFLAGS)" ./cmd/anx optimize --apply
+	@$(ANX_RUN) optimize --apply
 
 rebuild:
-	@go run -ldflags "$(LDFLAGS)" ./cmd/anx rebuild all
+	@$(ANX_RUN) rebuild all
 
 rebuild-tools: rebuild
 
@@ -92,16 +102,16 @@ wizard:
 	@./install.sh --wizard
 
 backup:
-	@go run -ldflags "$(LDFLAGS)" ./cmd/anx backup create
+	@$(ANX_RUN) backup create
 
 restore:
-	@go run -ldflags "$(LDFLAGS)" ./cmd/anx backup restore -latest
+	@$(ANX_RUN) backup restore -latest
 
 diff:
-	@go run -ldflags "$(LDFLAGS)" ./cmd/anx sync --dry-run
+	@$(ANX_RUN) sync --dry-run
 
 sync:
-	@go run -ldflags "$(LDFLAGS)" ./cmd/anx sync
+	@$(ANX_RUN) sync
 
 clean:
 	@rm -rf bin/ /tmp/env_test_sandbox.* /tmp/bats_sandbox.* 2>/dev/null || true
