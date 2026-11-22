@@ -1050,7 +1050,7 @@ func TestWizardApplyingMultiProgressConcurrentWorkers(t *testing.T) {
 	if !strings.Contains(renderedAfter, "CONCURRENT WORKERS (2 executing in parallel)") {
 		t.Errorf("expected 2 concurrent workers header, got:\n%s", renderedAfter)
 	}
-	if !strings.Contains(renderedAfter, "RECENTLY COMPLETED:") {
+	if !strings.Contains(renderedAfter, "SUCCEEDED (1)") {
 		t.Errorf("expected recently completed section, got:\n%s", renderedAfter)
 	}
 	if !strings.Contains(renderedAfter, "✔ git") {
@@ -1511,25 +1511,9 @@ func TestWizardDestroyerToggleReplansWithForceAndRendersOSConfigStatus(t *testin
 	if !w.destroyerMode || w.stage != StagePlanning || cmd == nil {
 		t.Fatalf("expected [d] toggle in StageReviewPlan to enter StagePlanning with cmd, got destroyer=%v stage=%v cmd=%v", w.destroyerMode, w.stage, cmd)
 	}
-	rawMsg := cmd()
-	batch, ok := rawMsg.(tea.BatchMsg)
-	if !ok {
-		t.Fatalf("expected tea.BatchMsg from StagePlanning trigger, got %T (%#v)", rawMsg, rawMsg)
-	}
-	var planMsg wizardPlanDoneMsg
-	foundPlan := false
-	for _, subCmd := range batch {
-		if subCmd == nil {
-			continue
-		}
-		if pm, ok := subCmd().(wizardPlanDoneMsg); ok {
-			planMsg = pm
-			foundPlan = true
-			break
-		}
-	}
-	if !foundPlan || planMsg.err != nil || planMsg.plan == nil {
-		t.Fatalf("expected wizardPlanDoneMsg with plan inside batch, got found=%v msg=%#v", foundPlan, planMsg)
+	planMsg, ok := cmd().(wizardPlanDoneMsg)
+	if !ok || planMsg.err != nil || planMsg.plan == nil {
+		t.Fatalf("expected a completed plan from the planning command, got %#v", planMsg)
 	}
 	if len(planMsg.plan.Steps) < 3 {
 		t.Fatalf("expected destroyer force plan to reschedule all 3 pre-installed packages, got %d steps", len(planMsg.plan.Steps))
@@ -1566,12 +1550,12 @@ func TestFoxLogoResponsiveTiersAndBounds(t *testing.T) {
 	t.Setenv("NO_COLOR", "")
 
 	cases := []struct {
-		name      string
-		width     int
-		height    int
-		wantTier  LogoTier
-		minLines  int
-		maxLines  int
+		name     string
+		width    int
+		height   int
+		wantTier LogoTier
+		minLines int
+		maxLines int
 	}{
 		{name: "large", width: 120, height: 36, wantTier: LogoTierFull, minLines: 15, maxLines: 15},
 		{name: "medium", width: 72, height: 22, wantTier: LogoTierCompact, minLines: 7, maxLines: 7},
@@ -1736,8 +1720,8 @@ func TestWizardAnimatedFoxHeaderAndWelcome(t *testing.T) {
 
 	nm, cmd := wiz.Update(wizardSpinnerTickMsg(time.Now()))
 	w := nm.(WizardModel)
-	if w.spinnerFrame != 1 || cmd == nil {
-		t.Fatalf("expected wizardSpinnerTickMsg to advance spinnerFrame and reschedule, got frame=%d cmd=%v", w.spinnerFrame, cmd)
+	if w.animation.lastFrame.IsZero() || cmd == nil {
+		t.Fatal("expected animation tick to start the clock and reschedule")
 	}
 
 	view := w.View().Content
@@ -1746,3 +1730,94 @@ func TestWizardAnimatedFoxHeaderAndWelcome(t *testing.T) {
 	}
 }
 
+func TestWizardLiveResultsRetainAndSeparateOutcomes(t *testing.T) {
+	deps := newTestDeps(t)
+	w := NewWizardModel(deps.Platform, deps.Catalog, nil)
+	w.stage = StageApplying
+	for i := range 9 {
+		status := domain.StepSuccess
+		if i == 7 {
+			status = domain.StepFailed
+		} else if i == 8 {
+			status = domain.StepSkipped
+		}
+		m, _ := w.Update(wizardProgressMsg{
+			StepID: i + 1, ResourceID: fmt.Sprintf("package-%d", i), Status: status, Description: "dependency issue",
+		})
+		w = m.(WizardModel)
+	}
+	view := ansi.Strip(w.renderApplying(65))
+	success, rest, ok := strings.Cut(view, "NOT INSTALLED (2)")
+	if !ok || !strings.Contains(success, "SUCCEEDED (7)") ||
+		!strings.Contains(success, "✔ package-0") || !strings.Contains(success, "✔ package-6") ||
+		strings.Index(success, "✔ package-6") > strings.Index(success, "✔ package-0") ||
+		!strings.Contains(rest, "✖ package-7") || !strings.Contains(rest, "– package-8") {
+		t.Fatalf("missing or mixed live outcomes:\n%s", view)
+	}
+}
+
+func TestWizardAnimationInterpolatesWithoutOvershooting(t *testing.T) {
+	deps := newTestDeps(t)
+	w := NewWizardModel(deps.Platform, deps.Catalog, nil)
+	w.stage = StageApplying
+
+	t0 := time.Unix(42, 0)
+	model, _ := w.Update(wizardSpinnerTickMsg(t0))
+	model, _ = model.Update(wizardProgressMsg{Percent: 80})
+	initial := ansi.Strip(model.(WizardModel).renderApplying(100))
+	model, _ = model.Update(wizardSpinnerTickMsg(t0.Add(time.Second / 60)))
+	firstFrame := ansi.Strip(model.(WizardModel).renderApplying(100))
+	if initial == firstFrame || !strings.Contains(firstFrame, "80%") ||
+		strings.Contains(firstFrame, strings.Repeat("█", 32)) || !strings.Contains(firstFrame, "█") {
+		t.Fatalf("first animation frame should move the bar while keeping the factual target: %s", firstFrame)
+	}
+	model, _ = model.Update(wizardProgressMsg{Percent: 74})
+	model, _ = model.Update(wizardSpinnerTickMsg(t0.Add(time.Second)))
+	settled := ansi.Strip(model.(WizardModel).renderApplying(100))
+	if !strings.Contains(settled, strings.Repeat("█", 32)+strings.Repeat("░", 8)) ||
+		!strings.Contains(settled, "80%") {
+		t.Fatalf("bar did not settle at 80%%: %s", settled)
+	}
+}
+
+func TestWizardWorkerBoxUsesAccentThroughStyledChildOutput(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	deps := newTestDeps(t)
+	w := NewWizardModel(deps.Platform, deps.Catalog, nil)
+	w.stage = StageApplying
+	model, _ := w.Update(wizardProgressMsg{
+		StepID: 1, ResourceID: "provider", Status: domain.StepRunning, OutputLine: "\x1b[38;2;0;255;1mchild\x1b[0m",
+	})
+	boxes := model.View().Content
+	accent := w.styles.Header.Render("│")
+	for _, row := range strings.Split(boxes, "\n") {
+		if strings.Contains(ansi.Strip(row), "child") &&
+			(strings.Count(row, accent) != 2 || strings.Contains(row, "0;255;1")) {
+			t.Fatalf("terminal output changed the themed box: %q", row)
+		}
+	}
+}
+
+func BenchmarkWizardApplyingFrame(b *testing.B) {
+	w := NewWizardModel(platform.Detect(), nil, nil)
+	w.stage = StageApplying
+	w.width, w.height = 140, 36
+	t0 := time.Unix(42, 0)
+	for i := range 65 {
+		status := domain.StepSuccess
+		if i >= 60 {
+			status = domain.StepRunning
+		}
+		m, _ := w.Update(wizardProgressMsg{
+			StepID: i + 1, ResourceID: fmt.Sprintf("package-%d", i), Status: status,
+			Percent: 80, OutputLine: "Downloading and verifying archive",
+		})
+		w = m.(WizardModel)
+	}
+	b.ResetTimer()
+	for i := 0; b.Loop(); i++ {
+		m, _ := w.Update(wizardSpinnerTickMsg(t0.Add(time.Duration(i) * time.Second / 60)))
+		w = m.(WizardModel)
+		_ = w.View()
+	}
+}

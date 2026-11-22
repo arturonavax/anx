@@ -86,7 +86,7 @@ func waitForProgressCmd(ch <-chan tea.Msg) tea.Cmd {
 type wizardSpinnerTickMsg time.Time
 
 func tickSpinnerCmd() tea.Cmd {
-	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(time.Second/wizardFPS, func(t time.Time) tea.Msg {
 		return wizardSpinnerTickMsg(t)
 	})
 }
@@ -128,7 +128,7 @@ type WizardModel struct {
 	planScrollOffset      int
 	applyScrollOffset     int
 	completedScrollOffset int
-	spinnerFrame          int
+	animation             wizardAnimation
 	plan                  *domain.ExecutionPlan
 	progressStep          int
 	progressTotal         int
@@ -141,7 +141,6 @@ type WizardModel struct {
 	progressMsg           string
 	activeWorkers         map[int]activeWorkerSlot
 	activeWorkerOrder     []int
-	recentCompleted       []string
 	completedSteps        int
 	workerLogs            map[int][]string
 	recentOutputLines     []string
@@ -404,7 +403,6 @@ func NewWizardModel(
 		sudoAuthCmdFn:     security.NewSudoAuthCmd,
 		activeWorkers:     make(map[int]activeWorkerSlot),
 		activeWorkerOrder: make([]int, 0),
-		recentCompleted:   make([]string, 0),
 		workerLogs:        make(map[int][]string),
 		recentOutputLines: make([]string, 0),
 		failedItems:       make([]string, 0),
@@ -597,7 +595,7 @@ func (w WizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if w.stage == StageReviewPlan && w.installSvc != nil {
 				w.stage = StagePlanning
 				cmd := runWizardPlanCmd(w.installSvc, w.syncSvc, w.ChosenProfile(), w.selectedPackageList(), w.destroyerMode)
-				return w, tea.Batch(cmd, tickSpinnerCmd())
+				return w, cmd
 			}
 
 		case "enter":
@@ -635,7 +633,7 @@ func (w WizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				selectedList := w.selectedPackageList()
 				w.stage = StagePlanning
 				cmd := runWizardPlanCmd(w.installSvc, w.syncSvc, w.ChosenProfile(), selectedList, w.destroyerMode)
-				return w, tea.Batch(cmd, tickSpinnerCmd())
+				return w, cmd
 
 			case StageReviewPlan:
 				if w.needsSudo() && w.sudoCheckFn != nil && !w.sudoCheckFn() {
@@ -735,7 +733,7 @@ func (w WizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		w.progressAction = msg.Action
 		w.progressResource = msg.ResourceID
 		w.progressDesc = msg.Description
-		w.progressPercent = msg.Percent
+		w.progressPercent = max(w.progressPercent, min(100, msg.Percent))
 
 		if w.activeWorkers == nil {
 			w.activeWorkers = make(map[int]activeWorkerSlot)
@@ -804,22 +802,6 @@ func (w WizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				w.completedSteps++
 			}
-			badge := "✔"
-			switch msg.Status {
-			case domain.StepFailed:
-				badge = "✖"
-			case domain.StepSkipped:
-				badge = "ℹ"
-			}
-			act := msg.Action
-			if act == "" {
-				act = "install"
-			}
-			rec := fmt.Sprintf("%s %s [%s]", badge, msg.ResourceID, strings.ToUpper(act))
-			w.recentCompleted = append(w.recentCompleted, rec)
-			if len(w.recentCompleted) > 5 {
-				w.recentCompleted = w.recentCompleted[len(w.recentCompleted)-5:]
-			}
 		}
 
 		return w, waitForProgressCmd(w.progressChan)
@@ -848,10 +830,10 @@ func (w WizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return w, nil
 
 	case wizardSpinnerTickMsg:
-		if w.quitting {
+		if w.quitting || w.stage == StageCompleted {
 			return w, nil
 		}
-		w.spinnerFrame++
+		w.animation.advance(time.Time(msg), w.progressPercent)
 		return w, tickSpinnerCmd()
 
 	case tea.WindowSizeMsg:
@@ -968,7 +950,6 @@ func (w WizardModel) startApplying() (tea.Model, tea.Cmd) {
 	w.failedItems = nil
 	w.skippedItems = nil
 	w.succeededItems = nil
-	w.recentCompleted = nil
 	w.osConfigStatus = ""
 	w.osConfigErr = nil
 	profName := ""
@@ -1002,7 +983,7 @@ func (w WizardModel) startApplying() (tea.Model, tea.Cmd) {
 		w.store,
 		progressChan,
 	)
-	return w, tea.Batch(waitForProgressCmd(progressChan), tickSpinnerCmd())
+	return w, waitForProgressCmd(progressChan)
 }
 
 func runWizardPlanCmd(installSvc *app.InstallService, syncSvc *app.SyncService, profName string, selectedList []string, destroyerMode bool) tea.Cmd {
@@ -1387,7 +1368,7 @@ func (w WizardModel) View() tea.View {
 	}
 
 	noColor := theme.IsNoColor() || (w.styles != nil && w.styles.Palette.Name == theme.NoColorPalette.Name)
-	badge := RenderFoxBadge(w.spinnerFrame, noColor)
+	badge := w.animation.foxBadge(noColor)
 	header := fmt.Sprintf(" %s  %s%s",
 		badge,
 		w.styles.Header.Render("ANX SETUP WIZARD"),
@@ -1436,7 +1417,7 @@ func (w WizardModel) renderSelectProfile(width int) string {
 		if w.height < 30 {
 			logoH = 20 // Compact crest when vertical space is moderate
 		}
-		logo := RenderFoxLogo(width-2, logoH, w.spinnerFrame, noColor)
+		logo := RenderFoxLogo(width-2, logoH, int(w.animation.age.Seconds()*8), noColor)
 		lines = append(lines, strings.Split(logo, "\n")...)
 		lines = append(lines, "")
 	}
@@ -1920,6 +1901,11 @@ func (w WizardModel) renderCompleted(width int, height ...int) string {
 				lines = append(lines, w.styles.Muted.Render(wl))
 			}
 		}
+		if len(w.skippedItems) > 0 {
+			lines = append(lines, "")
+			lines = append(lines, w.styles.Warning.Render(fmt.Sprintf("Skipped (%d):", len(w.skippedItems))))
+			lines = append(lines, AnsiWrap("   "+strings.Join(w.skippedItems, ", "), width-4)...)
+		}
 		if w.osConfigStatus != "" {
 			lines = append(lines, "")
 			if strings.Contains(w.osConfigStatus, "warning") || strings.Contains(w.osConfigStatus, "skipped") {
@@ -1974,9 +1960,7 @@ func (w WizardModel) renderCompleted(width int, height ...int) string {
 }
 
 func (w WizardModel) renderPlanning(width int) string {
-	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	frame := frames[w.spinnerFrame%len(frames)]
-	spinner := w.styles.Header.Render(frame)
+	spinner := w.renderLoadingGlyph(0)
 	title := w.styles.Highlight.Render("Resolving dependency graph and building execution plan...")
 
 	lines := []string{
@@ -1991,81 +1975,6 @@ func (w WizardModel) renderPlanning(width int) string {
 	return strings.Join(lines, "\n")
 }
 
-func (w WizardModel) renderProgressBar(percent, barWidth int) string {
-	if barWidth < 10 {
-		barWidth = 10
-	}
-	if percent < 0 {
-		percent = 0
-	}
-	if percent > 100 {
-		percent = 100
-	}
-	filled := (percent * barWidth) / 100
-	empty := barWidth - filled
-
-	barFilled := strings.Repeat("█", filled)
-	barEmpty := strings.Repeat("░", empty)
-
-	return fmt.Sprintf("[%s%s] %3d%%", w.styles.Header.Render(barFilled), w.styles.Muted.Render(barEmpty), percent)
-}
-
-func (w WizardModel) renderWorkerPulseBar(frame, barWidth int) string {
-	if barWidth < 8 {
-		barWidth = 8
-	}
-	period := barWidth * 2
-	pos := frame % period
-	if pos >= barWidth {
-		pos = period - 1 - pos
-	}
-	var b strings.Builder
-	b.WriteString("[")
-	for i := 0; i < barWidth; i++ {
-		dist := i - pos
-		if dist < 0 {
-			dist = -dist
-		}
-		if dist <= 1 {
-			b.WriteString(w.styles.Header.Render("█"))
-		} else {
-			b.WriteString(w.styles.Muted.Render("░"))
-		}
-	}
-	b.WriteString("]")
-	return b.String()
-}
-
-func (w WizardModel) renderWorkerIndividualBar(slot activeWorkerSlot, frame, barWidth int) string {
-	if barWidth < 10 {
-		barWidth = 10
-	}
-	elapsed := time.Since(slot.StartedAt)
-	if elapsed < 0 || slot.StartedAt.IsZero() {
-		elapsed = 0
-	}
-	period := barWidth * 2
-	pos := frame % period
-	if pos >= barWidth {
-		pos = period - 1 - pos
-	}
-	var b strings.Builder
-	b.WriteString("[")
-	for i := 0; i < barWidth; i++ {
-		dist := i - pos
-		if dist < 0 {
-			dist = -dist
-		}
-		if dist <= 1 {
-			b.WriteString(w.styles.Header.Render("█"))
-		} else {
-			b.WriteString(w.styles.Muted.Render("░"))
-		}
-	}
-	b.WriteString("]")
-	return fmt.Sprintf("%s %s", b.String(), w.styles.Muted.Render(fmt.Sprintf("%4.1fs", elapsed.Seconds())))
-}
-
 func (w WizardModel) renderWorkerOutputBox(slot activeWorkerSlot, width int) []string {
 	outputs := slot.Outputs
 	if len(outputs) == 0 {
@@ -2073,7 +1982,7 @@ func (w WizardModel) renderWorkerOutputBox(slot activeWorkerSlot, width int) []s
 	}
 	return wizardLogBox(width, outputs, wizardLogPanel{
 		indent: "   ", title: "[" + slot.ResourceID + "] output", prefix: "> ", limit: 3,
-		border: w.styles.Muted, body: lipgloss.NewStyle().Foreground(w.styles.Palette.Foreground),
+		border: w.styles.Header, body: lipgloss.NewStyle().Foreground(w.styles.Palette.Foreground),
 	})
 }
 
@@ -2108,7 +2017,7 @@ func wizardLogBox(width int, output []string, p wizardLogPanel) []string {
 	side := p.border.Render("│")
 	for _, raw := range output[max(0, len(output)-p.limit):] {
 		// Terminal tab stops depend on the column; use fixed spaces before measuring.
-		raw = strings.ReplaceAll(raw, "\t", "    ")
+		raw = strings.ReplaceAll(ansi.Strip(raw), "\t", "    ")
 		for _, row := range AnsiWrap(raw, textWidth) {
 			row = AnsiTruncate(row, textWidth)
 			padding := strings.Repeat(" ", textWidth-ansi.StringWidth(row))
@@ -2118,7 +2027,7 @@ func wizardLogBox(width int, output []string, p wizardLogPanel) []string {
 	return append(lines, p.indent+p.border.Render("└"+strings.Repeat("─", boxWidth-2)+"┘"))
 }
 
-func (w WizardModel) renderActiveWorkerRows(width int, frames []string) []string {
+func (w WizardModel) renderActiveWorkerRows(width int) []string {
 	available := width - 4
 	rows := make([]string, 0, len(w.activeWorkerOrder))
 	details := make([]string, 0)
@@ -2126,21 +2035,20 @@ func (w WizardModel) renderActiveWorkerRows(width int, frames []string) []string
 	singleLine := strings.NewReplacer("\n", " ", "\r", " ", "\t", "    ")
 	for _, id := range w.activeWorkerOrder {
 		slot := w.activeWorkers[id]
-		frame := w.spinnerFrame + id
 		action := strings.ToUpper(slot.Action)
 		if action == "" {
 			action = "INSTALL"
 		}
 		label := fmt.Sprintf("   %s %s %s",
-			w.styles.Header.Render(frames[frame%len(frames)]),
+			w.renderLoadingGlyph(id),
 			w.styles.Success.Render("["+action+"]"),
 			w.styles.Highlight.Render(slot.ResourceID),
 		)
-		bar := w.renderWorkerIndividualBar(slot, frame, 12)
+		bar := w.renderWorkerIndividualBar(slot, 12)
 		row := AnsiTruncate(label, available-ansi.StringWidth(bar)-1) + " " + bar
 		if len(w.activeWorkers) > 1 && len(slot.Outputs) > 0 {
 			latest := slot.Outputs[len(slot.Outputs)-1]
-			latest = singleLine.Replace(latest)
+			latest = singleLine.Replace(ansi.Strip(latest))
 			room := available - ansi.StringWidth(row) - 2
 			if room >= 12 {
 				row += "  " + text.Render(AnsiTruncate(latest, room))
@@ -2155,9 +2063,7 @@ func (w WizardModel) renderActiveWorkerRows(width int, frames []string) []string
 }
 
 func (w WizardModel) renderApplying(width int, height ...int) string {
-	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	frame := frames[w.spinnerFrame%len(frames)]
-	spinner := w.styles.Header.Render(frame)
+	spinner := w.renderLoadingGlyph(0)
 
 	phase := w.progressPhase
 	if phase == "" {
@@ -2183,12 +2089,13 @@ func (w WizardModel) renderApplying(width int, height ...int) string {
 		}
 	}
 
-	progressBar := w.renderProgressBar(w.progressPercent, barWidth) + w.styles.Muted.Render(stepInfo)
+	progressBar := w.renderProgressBar(barWidth) + w.styles.Muted.Render(stepInfo)
 
 	lines := []string{
 		title,
 		"",
 		fmt.Sprintf("  %s %s", w.styles.Header.Render("GLOBAL PROGRESS:"), progressBar),
+		w.renderOutcomeCounts(),
 	}
 
 	if len(w.activeWorkers) > 0 {
@@ -2197,7 +2104,7 @@ func (w WizardModel) renderApplying(width int, height ...int) string {
 			heading = fmt.Sprintf("CONCURRENT WORKERS (%d executing in parallel):", len(w.activeWorkers))
 		}
 		lines = append(lines, "", "  "+w.styles.Header.Render(heading))
-		lines = append(lines, w.renderActiveWorkerRows(width, frames)...)
+		lines = append(lines, w.renderActiveWorkerRows(width)...)
 		if len(w.activeWorkerOrder) == 1 {
 			lines = append(lines, w.renderWorkerOutputBox(w.activeWorkers[w.activeWorkerOrder[0]], width)...)
 		}
@@ -2217,17 +2124,10 @@ func (w WizardModel) renderApplying(width int, height ...int) string {
 	lines = append(lines, "")
 	lines = append(lines, w.renderGlobalOutputBox(width)...)
 
-	if len(w.recentCompleted) > 0 {
-		lines = append(lines, "", w.styles.Muted.Render("  RECENTLY COMPLETED:"))
-		for _, item := range w.recentCompleted {
-			lines = append(lines, fmt.Sprintf("   %s", w.styles.Success.Render(item)))
-		}
+	lines = append(lines, "")
+	if len(w.succeededItems)+len(w.failedItems)+len(w.skippedItems) > 0 {
+		lines = append(lines, w.renderLiveOutcomes(width-4)...)
 	}
-
-	lines = append(lines, "",
-		w.styles.Muted.Render("  • Base tools prioritized first (curl, wget, build-essential, git, ghostty)."),
-		w.styles.Muted.Render("  • DAG scheduler executes independent downloads, builds, and syncs concurrently."),
-		w.styles.Muted.Render("  • Fault-tolerant: single package failures do not abort remaining installations."))
 
 	var allLines []string
 	for _, l := range lines {
