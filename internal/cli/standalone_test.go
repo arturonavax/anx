@@ -276,4 +276,22 @@ language: bash
 	if len(seenSSHCmds) == 0 || !strings.Contains(seenSSHCmds[0], "id_vault") {
 		t.Fatalf("expected repo clone to forward --ssh-key in GIT_SSH_COMMAND, got %v", seenSSHCmds)
 	}
+
+	// 6. Credentials embedded in ssh:// URLs must be redacted in stdout/stderr
+	out.Reset()
+	errOut.Reset()
+	code = cli.ExecuteCLI(
+		[]string{"tools", "source", "verify", "ssh://user:secret-token@github.com/example-org/vault.git", "--ssh-key", keyPath},
+		&out,
+		&errOut,
+		"2.0.0-test",
+		"",
+		"",
+	)
+	if code != 0 {
+		t.Fatalf("tools source verify ssh:// URL failed (%d): stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if strings.Contains(out.String(), "secret-token") || strings.Contains(errOut.String(), "secret-token") {
+		t.Fatalf("expected embedded credentials to be redacted from output, got stdout=%q stderr=%q", out.String(), errOut.String())
+	}
 }

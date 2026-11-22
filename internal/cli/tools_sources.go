@@ -184,7 +184,8 @@ func newToolsSourceCmd(appCtx *AppContext) *cobra.Command {
 					if err != nil {
 						return err
 					}
-					fmt.Fprintf(cmd.OutOrStdout(), "SSH access verified: %s\n", probe.ResolvedURL)
+					redactedResolved := gittransport.NormalizeURL(probe.ResolvedURL).Redacted
+					fmt.Fprintf(cmd.OutOrStdout(), "SSH access verified: %s\n", redactedResolved)
 					if src.SSHKey != "" && (src.Auth == "" || strings.EqualFold(src.Auth, string(gittransport.AuthAuto))) {
 						src.Auth = string(gittransport.AuthSSH)
 					}
@@ -267,7 +268,8 @@ func newToolsSourceCmd(appCtx *AppContext) *cobra.Command {
 					if pErr != nil {
 						return pErr
 					}
-					fmt.Fprintf(cmd.OutOrStdout(), "SSH access verified for %q (%s)\n", s.ID, probe.ResolvedURL)
+					redactedResolved := gittransport.NormalizeURL(probe.ResolvedURL).Redacted
+					fmt.Fprintf(cmd.OutOrStdout(), "SSH access verified for %q (%s)\n", s.ID, redactedResolved)
 					if verifySSHOnly {
 						return nil
 					}
@@ -285,7 +287,8 @@ func newToolsSourceCmd(appCtx *AppContext) *cobra.Command {
 				if pErr != nil {
 					return pErr
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "SSH access verified for %s (%s)\n", probe.Normalized.Redacted, probe.ResolvedURL)
+				redactedResolved := gittransport.NormalizeURL(probe.ResolvedURL).Redacted
+				fmt.Fprintf(cmd.OutOrStdout(), "SSH access verified for %s (%s)\n", probe.Normalized.Redacted, redactedResolved)
 				return nil
 			}
 
