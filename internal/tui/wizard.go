@@ -2066,93 +2066,54 @@ func (w WizardModel) renderWorkerIndividualBar(slot activeWorkerSlot, frame, bar
 }
 
 func (w WizardModel) renderWorkerOutputBox(slot activeWorkerSlot, width int) []string {
-	boxWidth := width - 6
-	if boxWidth < 30 {
-		boxWidth = 30
-	}
-	innerBoxWidth := boxWidth - 4
-	if innerBoxWidth < 20 {
-		innerBoxWidth = 20
-	}
-
-	header := fmt.Sprintf("┌─ [%s] output ─", slot.ResourceID)
-	if len(header) < boxWidth {
-		header += strings.Repeat("─", boxWidth-len(header)-1) + "┐"
-	} else {
-		header = header[:boxWidth-1] + "┐"
-	}
-
-	var boxLines []string
-	boxLines = append(boxLines, "   "+w.styles.Muted.Render(header))
-
 	outputs := slot.Outputs
 	if len(outputs) == 0 {
 		outputs = []string{"Preparing operation..."}
 	}
-	start := 0
-	if len(outputs) > 3 {
-		start = len(outputs) - 3
+	lines := wizardLogBox(width, "   ", "["+slot.ResourceID+"] output", "> ", outputs, 3)
+	for i, line := range lines {
+		lines[i] = w.styles.Muted.Render(line)
 	}
-	for _, rawLine := range outputs[start:] {
-		wrapped := AnsiWrap(rawLine, innerBoxWidth-2)
-		for _, wl := range wrapped {
-			pad := innerBoxWidth - ansi.StringWidth(wl)
-			if pad < 0 {
-				pad = 0
-			}
-			lineContent := fmt.Sprintf("│ > %s%s │", wl, strings.Repeat(" ", pad))
-			boxLines = append(boxLines, "   "+w.styles.Muted.Render(lineContent))
-		}
-	}
-
-	footer := "└" + strings.Repeat("─", boxWidth-2) + "┘"
-	boxLines = append(boxLines, "   "+w.styles.Muted.Render(footer))
-	return boxLines
+	return lines
 }
 
 func (w WizardModel) renderGlobalOutputBox(width int) []string {
-	boxWidth := width - 4
-	if boxWidth < 30 {
-		boxWidth = 30
-	}
-	innerBoxWidth := boxWidth - 4
-	if innerBoxWidth < 20 {
-		innerBoxWidth = 20
-	}
-
-	header := "┌─ LIVE PROGRESS OUTPUT STREAM ─"
-	if len(header) < boxWidth {
-		header += strings.Repeat("─", boxWidth-len(header)-1) + "┐"
-	} else {
-		header = header[:boxWidth-1] + "┐"
-	}
-
-	var boxLines []string
-	boxLines = append(boxLines, "  "+w.styles.Header.Render(header))
-
 	recent := w.recentOutputLines
 	if len(recent) == 0 {
 		recent = []string{"Initializing deployment operations..."}
 	}
-	start := 0
-	if len(recent) > 6 {
-		start = len(recent) - 6
-	}
-	for _, rawLine := range recent[start:] {
-		wrapped := AnsiWrap(rawLine, innerBoxWidth-2)
-		for _, wl := range wrapped {
-			pad := innerBoxWidth - ansi.StringWidth(wl)
-			if pad < 0 {
-				pad = 0
-			}
-			lineContent := fmt.Sprintf("│ %s%s │", wl, strings.Repeat(" ", pad))
-			boxLines = append(boxLines, "  "+w.styles.Muted.Render(lineContent))
+	lines := wizardLogBox(width, "  ", "LIVE PROGRESS OUTPUT STREAM", "", recent, 6)
+	for i, line := range lines {
+		if i == 0 || i == len(lines)-1 {
+			lines[i] = w.styles.Header.Render(line)
+		} else {
+			lines[i] = w.styles.Muted.Render(line)
 		}
 	}
+	return lines
+}
 
-	footer := "└" + strings.Repeat("─", boxWidth-2) + "┘"
-	boxLines = append(boxLines, "  "+w.styles.Header.Render(footer))
-	return boxLines
+func wizardLogBox(width int, indent, title, prefix string, output []string, limit int) []string {
+	// renderApplying reserves four columns when wrapping the page.
+	boxWidth := width - 4 - len(indent)
+	textWidth := boxWidth - len(prefix) - 4 // Two borders and two spaces.
+	if textWidth < 1 {
+		return nil
+	}
+
+	label := AnsiTruncate("─ "+title+" ", boxWidth-2)
+	top := indent + "┌" + label + strings.Repeat("─", boxWidth-2-ansi.StringWidth(label)) + "┐"
+	lines := []string{top}
+	for _, raw := range output[max(0, len(output)-limit):] {
+		// Terminal tab stops depend on the column; use fixed spaces before measuring.
+		raw = strings.ReplaceAll(raw, "\t", "    ")
+		for _, row := range AnsiWrap(raw, textWidth) {
+			row = AnsiTruncate(row, textWidth)
+			padding := strings.Repeat(" ", textWidth-ansi.StringWidth(row))
+			lines = append(lines, indent+"│ "+prefix+row+padding+" │")
+		}
+	}
+	return append(lines, indent+"└"+strings.Repeat("─", boxWidth-2)+"┘")
 }
 
 func (w WizardModel) renderApplying(width int, height ...int) string {

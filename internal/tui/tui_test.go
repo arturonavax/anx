@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/arturonavax/anx/internal/app"
@@ -1143,6 +1144,59 @@ func TestWizardProgressOutputWidgetsAndErrorSummary(t *testing.T) {
 	}
 	if !strings.Contains(completedView, "Failed Components (1)") || !strings.Contains(completedView, "lazygit") {
 		t.Errorf("expected lazygit in failed section, got:\n%s", completedView)
+	}
+}
+
+func TestWizardApplyingLogBoxesKeepAlignedBorders(t *testing.T) {
+	for _, width := range []int{50, 100} {
+		t.Run(fmt.Sprint(width), func(t *testing.T) {
+			deps := newTestDeps(t)
+			w := NewWizardModel(deps.Platform, deps.Catalog, nil)
+			w.stage = StageApplying
+			w.width, w.height = width, 100
+			resourceID := strings.Repeat("環", 18)
+			output := "\x1b[1m🍺 installing\x1b[0m \t" + strings.Repeat("依", 60) + " done"
+			model, _ := w.Update(wizardProgressMsg{
+				StepID: 1, ResourceID: resourceID, Status: domain.StepRunning, OutputLine: output,
+			})
+
+			var leftPad, rightEdge, boxes, messages int
+			inBox := false
+			for _, row := range strings.Split(ansi.Strip(model.View().Content), "\n") {
+				trimmed := strings.TrimLeft(row, " ")
+				if strings.HasPrefix(trimmed, "┌") {
+					leftPad = len(row) - len(trimmed)
+					rightEdge = ansi.StringWidth(row)
+					inBox = true
+				}
+				if !inBox {
+					continue
+				}
+				_, top := strings.CutPrefix(trimmed, "┌")
+				_, bottom := strings.CutPrefix(trimmed, "└")
+				_, body := strings.CutPrefix(trimmed, "│")
+				aligned := top && strings.HasSuffix(row, "┐") ||
+					bottom && strings.HasSuffix(row, "┘") || body && strings.HasSuffix(row, "│")
+				if !aligned || len(row)-len(trimmed) != leftPad ||
+					ansi.StringWidth(row) != rightEdge || rightEdge > width ||
+					strings.ContainsRune(row, '\t') || !utf8.ValidString(row) {
+					t.Fatalf("misaligned box row (expected right edge %d): %q", rightEdge, row)
+				}
+				if strings.Contains(row, " done") {
+					messages++
+				}
+				if strings.HasSuffix(row, "┘") {
+					boxes++
+					inBox = false
+				}
+			}
+			if boxes != 2 || inBox {
+				t.Fatalf("expected both complete log boxes, got %d", boxes)
+			}
+			if messages != 2 {
+				t.Fatalf("expected the end of the log message in both boxes, got %d", messages)
+			}
+		})
 	}
 }
 
