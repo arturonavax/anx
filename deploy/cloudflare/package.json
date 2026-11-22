@@ -1,5 +1,5 @@
 {
-  "name": "env-installer-router",
+  "name": "anx-installer-router",
   "version": "1.0.0",
   "type": "module",
   "description": "Cloudflare Worker intelligent edge router and script cache for ANX environment",

@@ -2,7 +2,7 @@ import { bindings, defineConfig } from "cf/config";
 
 export default defineConfig({
 	worker: {
-		name: "env-installer-router",
+		name: "anx-installer-router",
 		compatibilityDate: "2024-10-31",
 		compatibilityFlags: [
 			"nodejs_compat",
