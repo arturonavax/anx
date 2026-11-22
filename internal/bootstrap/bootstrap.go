@@ -354,7 +354,7 @@ func ResolveRepoRoot(configured, home, stored string) string {
 			}
 		}
 	}
-	if stored != "" && isDir(filepath.Join(stored, "files")) && isDir(filepath.Join(stored, "manifests")) {
+	if stored != "" && isDir(filepath.Join(stored, "manifests")) {
 		return stored
 	}
 	if managed := ManagedEnvironmentDir(home); isDir(filepath.Join(managed, "manifests")) {

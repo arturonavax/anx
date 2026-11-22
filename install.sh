@@ -201,6 +201,25 @@ prompt_out() {
 	fi
 }
 
+prompt_checkout_path() {
+	if [ -z "${ANX_CONFIG_REPO_DIR:-}" ]; then
+		prompt_out "  Environment checkout path (existing or empty directory; Enter keeps current/default): "
+		if [ -n "$TTY_DEV" ]; then
+			IFS= read -r checkout_path <"$TTY_DEV" || checkout_path=""
+		else
+			IFS= read -r checkout_path || checkout_path=""
+		fi
+		case "$checkout_path" in
+		"") ;;
+		/* | '~' | '~/'* | '$HOME/'*) ANX_CONFIG_REPO_DIR="$checkout_path" ;;
+		*) ANX_CONFIG_REPO_DIR="$PWD/$checkout_path" ;;
+		esac
+		if [ -n "$checkout_path" ]; then
+			export ANX_CONFIG_REPO_DIR
+		fi
+	fi
+}
+
 check_precompiled_release() {
 	if [ "$FORCE_SOURCE" -eq 1 ] || [ "$FORCE_GO_INSTALL" -eq 1 ]; then
 		return 1
@@ -321,7 +340,32 @@ if [ "$INTERACTIVE_TTY" -eq 1 ]; then
 	*)
 		INSTALL_ONLY=0
 		ANX_ONE_SHOT=1
+		prompt_checkout_path
 		set -- "wizard"
+		;;
+	esac
+fi
+
+
+# An explicitly requested interactive wizard also gets the path prompt.
+if [ "$INTERACTIVE_TTY" -eq 0 ] && [ "$INSTALL_ONLY" -eq 0 ]; then
+	case "${1:-}" in
+	wizard | -w | --wizard)
+		if [ "$1" != "wizard" ]; then
+			shift
+			set -- "wizard" "$@"
+		fi
+		prompt_enabled=1
+		for arg in "$@"; do
+			case "$arg" in
+			-y | --yes | --yes=true | --offline | --offline=true | --dry-run | --dry-run=true | --script | --script=true)
+				prompt_enabled=0
+				;;
+			esac
+		done
+		if [ "$prompt_enabled" -eq 1 ] && { [ -n "$TTY_DEV" ] || { [ -t 0 ] && [ -t 1 ]; }; }; then
+			prompt_checkout_path
+		fi
 		;;
 	esac
 fi

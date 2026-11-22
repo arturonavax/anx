@@ -44,6 +44,12 @@ enrolls the environment before it loads the plan. Use the installer's
 checkout or fetch one for an offline run or a dry run. Use `--install-only`
 on Linux/macOS to install just the ANX binary.
 
+Before opening an interactive wizard, the POSIX installer asks for an
+environment checkout path. Press Enter to keep the linked checkout or the
+managed default. Enter an existing environment directory to reuse it, or enter
+an unused/empty directory for a new checkout of the selected Git source. In
+automation, set `ANX_CONFIG_REPO_DIR` instead of responding to a prompt.
+
 ```sh
 sh ./install.sh wizard --yes --config-repo git@github.com:YOUR-ORG/YOUR-ENV.git
 ```
@@ -161,6 +167,18 @@ enrollment prefers SSH when available. For a private SSH origin, configure
 `ANX_SSH_KEY` or the key saved by `anx repo clone --ssh-key`, and establish
 the server's host key before pushing. The capture commit excludes unrelated
 staged changes. Offline and dry-run modes do not push.
+
+An environment installation script can clone an additional private repository
+without replacing the active environment:
+
+```sh
+anx repo clone "$EXTRA_REPO_SSH_URL" --auth ssh --dir "$EXTRA_REPO_DIR" --no-link
+```
+
+Supply the URL and directory outside committed manifests, and configure the
+server's host key and a permitted SSH identity first. You can pass `--ssh-key`
+or use `ANX_SSH_KEY`; `--no-link` does not reuse or persist the active
+environment's saved SSH key or pin. The target must be unused or empty.
 
 `anx repo status` reports the checked-out Git revision and cached upstream
 without fetching. `anx repo update --check` refreshes the current branch's

@@ -206,22 +206,41 @@ func newRepoCloneCmd(appCtx *AppContext) *cobra.Command {
 		ref       string
 		authMode  string
 		sshKey    string
+		noLink    bool
 	)
 	cmd := &cobra.Command{
 		Use:   "clone [url]",
 		Short: "Clone a remote configuration repository and link it to anx",
 		Long: `Clones a Git configuration repository using automatic SSH discovery with HTTPS fallback.
 Defaults to 'https://github.com/arturonavax/env' (or ANX_CONFIG_REPO) into '~/.local/share/anx/env'.
-Use --dir for another checkout. Existing files are never overwritten.`,
+Use --dir for another checkout. Existing files are never overwritten.
+For an auxiliary repo, pass an explicit URL with --dir and --no-link to leave the active environment unchanged.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			explicit := ""
 			if len(args) == 1 {
 				explicit = args[0]
 			}
+			if noLink {
+				remote := gittransport.NormalizeURL(explicit)
+				if strings.TrimSpace(targetDir) == "" || (!remote.IsSSH && !remote.IsHTTPS) {
+					return domain.NewExitError(domain.ExitUsageError, errors.New("--no-link requires an SSH or HTTPS Git URL and --dir"))
+				}
+			}
+			if noLink && appCtx.Flags.Offline && !appCtx.Flags.DryRun {
+				return domain.NewExitError(domain.ExitPreflightFailed, errors.New("cannot clone an auxiliary repository in offline mode"))
+			}
 			repoURL := resolveConfigRepoURL(appCtx, explicit)
 			chosenRef := resolveConfigRef(appCtx, ref)
 			chosenSSHKey := resolveConfigSSHKey(appCtx, sshKey)
+			if noLink {
+				// Do not inherit the linked environment's pin or persisted identity.
+				chosenRef = strings.TrimSpace(ref)
+				chosenSSHKey = strings.TrimSpace(sshKey)
+				if chosenSSHKey == "" {
+					chosenSSHKey = strings.TrimSpace(os.Getenv("ANX_SSH_KEY"))
+				}
+			}
 			mode, err := gittransport.ParseAuthMode(authMode)
 			if err != nil {
 				return domain.NewExitError(domain.ExitUsageError, err)
@@ -245,7 +264,11 @@ Use --dir for another checkout. Existing files are never overwritten.`,
 				return nil
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "Cloning configuration repository from %s into %s...\n", source, dest)
+			kind := "configuration"
+			if noLink {
+				kind = "auxiliary"
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Cloning %s repository from %s into %s...\n", kind, source, dest)
 			adapter := newGitAdapter()
 			probe, err := adapter.Clone(cmd.Context(), gittransport.CloneOptions{
 				URL:    repoURL,
@@ -259,6 +282,10 @@ Use --dir for another checkout. Existing files are never overwritten.`,
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Transport selected: %s (%s)\n", probe.Transport, probe.Normalized.Redacted)
+			if noLink {
+				fmt.Fprintf(cmd.OutOrStdout(), "Cloned auxiliary repository at %s (active environment unchanged).\n", dest)
+				return nil
+			}
 			if chosenSSHKey != "" && appCtx.Platform != nil {
 				_ = persistRepoSSHKey(appCtx.Platform.ConfigDir(), chosenSSHKey)
 			}
@@ -267,6 +294,7 @@ Use --dir for another checkout. Existing files are never overwritten.`,
 	}
 
 	cmd.Flags().StringVar(&targetDir, "dir", "", "Target destination directory (default: ~/.local/share/anx/env)")
+	cmd.Flags().BoolVar(&noLink, "no-link", false, "Clone an auxiliary repository without changing the active environment")
 	cmd.Flags().IntVar(&depth, "depth", 1, "Shallow clone depth (0 for full history)")
 	cmd.Flags().StringVar(&ref, "ref", "", "Branch, tag, or commit to checkout")
 	cmd.Flags().StringVar(&authMode, "auth", "auto", "Git authentication mode (auto|ssh|https)")
@@ -544,12 +572,15 @@ func persistRepoConfig(configDir, repoPath, sourceURL, ref string) error {
 	if raw, err := os.ReadFile(cfgPath); err == nil {
 		_ = yaml.Unmarshal(raw, &data)
 	}
+	previousRepo, _ := data["repo"].(string)
 	data["repo"] = repoPath
 	if sourceURL != "" {
 		data["config_repo"] = sourceURL
 	}
 	if ref != "" {
 		data["config_ref"] = ref
+	} else if previousRepo != repoPath {
+		delete(data, "config_ref")
 	}
 	out, err := yaml.Marshal(data)
 	if err != nil {

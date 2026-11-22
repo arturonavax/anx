@@ -41,10 +41,31 @@ func enrollInstallerEnvironment(cmd *cobra.Command, appCtx *AppContext, selectio
 	ref := resolveConfigRef(appCtx, "")
 	adapter := newGitAdapter()
 	ctx := cmd.Context()
+	dest := bootstrap.ManagedEnvironmentDir(appCtx.Platform.HomeDir())
+	existingRoot := appCtx.RepoRoot
+	custom := os.Getenv("ANX_CONFIG_REPO_DIR")
+	if custom != "" {
+		if strings.Contains(custom, "://") {
+			return domain.NewExitError(domain.ExitUsageError, fmt.Errorf(
+				"ANX_CONFIG_REPO_DIR needs a directory path; use --config-repo to select a Git URL",
+			))
+		}
+		var err error
+		dest, err = filepath.Abs(appCtx.Platform.ExpandPath(custom))
+		if err != nil {
+			return err
+		}
+		existingRoot = dest
+	}
 	if requested.IsLocal {
 		root, err := filepath.Abs(appCtx.Platform.ExpandPath(requested.Canonical))
 		if err != nil {
 			return err
+		}
+		if custom != "" && dest != root {
+			return domain.NewExitError(domain.ExitUsageError, fmt.Errorf(
+				"a local --config-repo is already a checkout; use that same path or select a Git URL",
+			))
 		}
 		if err := checkInstallerEnvironmentRef(ctx, adapter, root, selection.ref); err != nil {
 			return err
@@ -54,21 +75,37 @@ func enrollInstallerEnvironment(cmd *cobra.Command, appCtx *AppContext, selectio
 		}
 		return activateInstallerEnvironment(cmd, appCtx, root, root, ref)
 	}
-	if isDir(filepath.Join(appCtx.RepoRoot, "manifests")) {
+	if isDir(filepath.Join(existingRoot, "manifests")) {
+		source := existingRoot
 		if requested.Canonical != "" {
-			origin, err := adapter.LocalOrigin(ctx, appCtx.RepoRoot)
+			origin, err := adapter.LocalOrigin(ctx, existingRoot)
 			if err != nil || !sameInstallerEnvironmentOrigin(requested, gittransport.NormalizeURL(origin)) {
 				return domain.NewExitError(domain.ExitPreflightFailed, fmt.Errorf(
 					"linked environment %q does not match %s; link the requested environment before installing",
-					appCtx.RepoRoot, requested.Redacted,
+					existingRoot, requested.Redacted,
 				))
 			}
+			source = requested.Redacted
+		} else if custom != "" && isGitEnvironment(existingRoot) {
+			if origin, err := adapter.LocalOrigin(ctx, existingRoot); err == nil && origin != "" {
+				source = gittransport.NormalizeURL(origin).Redacted
+			}
 		}
-		return checkInstallerEnvironmentRef(ctx, adapter, appCtx.RepoRoot, selection.ref)
+		if err := checkInstallerEnvironmentRef(ctx, adapter, existingRoot, selection.ref); err != nil {
+			return err
+		}
+		if existingRoot != appCtx.RepoRoot {
+			return activateInstallerEnvironment(cmd, appCtx, existingRoot, source, strings.TrimSpace(selection.ref))
+		}
+		return nil
 	}
 
 	source := resolveConfigRepoURL(appCtx, "")
-	dest := bootstrap.ManagedEnvironmentDir(appCtx.Platform.HomeDir())
+	if custom != "" && gittransport.NormalizeURL(source).IsLocal {
+		return domain.NewExitError(domain.ExitUsageError, fmt.Errorf(
+			"choose an existing environment checkout or supply --config-repo <git-url> to clone into a new path",
+		))
+	}
 	if err := checkCheckoutDestination(dest); err != nil {
 		return err
 	}
