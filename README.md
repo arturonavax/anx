@@ -34,6 +34,26 @@ The bootstrap does not install GVM or Homebrew automatically. When Go is
 missing, it can use an existing GVM or native package manager. To avoid
 automatic toolchain setup, install Go first and build from source.
 
+### Windows
+
+Run the experimental ANX installer from PowerShell or Command Prompt:
+
+```cmd
+powershell.exe -NoProfile -Command "irm https://sh.arturonavax.dev/install.ps1 | iex"
+```
+
+The quick command executes the downloaded script immediately. To inspect it first,
+download it from Command Prompt, review it, and then run it if your policy allows:
+
+```cmd
+curl.exe -fsSLo anx-install.ps1 https://sh.arturonavax.dev/install.ps1
+notepad.exe anx-install.ps1
+powershell.exe -NoProfile -File .\anx-install.ps1
+```
+
+If your organization blocks the installer, use an approved source build or ask
+your administrator. Do not bypass endpoint protection or execution policy.
+
 ### From source (including Windows)
 
 [Install Go](https://go.dev/dl/) and run this from the reviewed checkout:
@@ -41,8 +61,6 @@ automatic toolchain setup, install Go first and build from source.
 ```sh
 go install ./cmd/anx
 ```
-
-The standalone Windows PowerShell installer is experimental.
 
 ## Versioning
 
