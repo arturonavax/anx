@@ -18,9 +18,9 @@ type LogoTier int
 const (
 	// LogoTierMinimal renders a single-line emblem for narrow or short terminals.
 	LogoTierMinimal LogoTier = iota
-	// LogoTierCompact renders a 3-line fox crest for medium terminals.
+	// LogoTierCompact renders a 7-line Braille fox head crest for medium terminals.
 	LogoTierCompact
-	// LogoTierFull renders the full 7-line hero fox + ANX wordmark for large terminals.
+	// LogoTierFull renders the full 15-line Braille fox + ANX wordmark for large terminals.
 	LogoTierFull
 )
 
@@ -55,7 +55,7 @@ func buildFoxGradientStyles() []lipgloss.Style {
 
 // SelectLogoTier chooses the responsive Fox logo tier from terminal dimensions.
 func SelectLogoTier(width, height int) LogoTier {
-	if width >= 88 && height >= 26 {
+	if width >= 88 && height >= 28 {
 		return LogoTierFull
 	}
 	if width >= 60 && height >= 18 {
@@ -103,21 +103,23 @@ func RenderFoxBadge(frame int, noColor bool) string {
 }
 
 func renderFullFoxHero(frame int, plain bool) []string {
-	eyeRune := '◈'
-	if !plain && (frame%8 == 0 || frame%8 == 1) {
-		eyeRune = '✦'
-	}
-
-	// Low-poly geometric Fox silhouette (8 lines x 21 cells).
+	// Full curled Braille Fox (15 lines x 25 cells).
 	foxArt := []string{
-		`  ◢◣             ◢◣  `,
-		` ◢█▀◣           ◢▀█◣ `,
-		`◢█▀ ▀◣ ▄▄▄▄▄▄▄ ◢▀ ▀█◣`,
-		`█▌  ◢███████████◣  ▐█`,
-		`◥█◣ ▐█ ` + string(eyeRune) + `  ▄  ` + string(eyeRune) + ` █▌ ◢█◤`,
-		` ◥██◣◥████▀████◤◢██◤ `,
-		`   ◥██◣  ◥▼◤  ◢██◤   `,
-		`     ◥████▄████◤     `,
+		`⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡀⠀`,
+		`⠀⠀⠀⠀⠀⠀⠀⠀⠀⣾⠙⠻⢶⣄⡀⠀⠀⠀⢀⣤⠶⠛⠛⡇⠀`,
+		`⠀⠀⠀⠀⠀⠀⠀⠀⠀⢹⣇⠀⠀⣙⣿⣦⣤⣴⣿⣁⠀⠀⣸⠇⠀`,
+		`⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⣡⣾⣿⣿⣿⣿⣿⣿⣿⣷⣌⠋⠀⠀`,
+		`⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣿⣷⣄⡈⢻⣿⡟⢁⣠⣾⣿⣦⠀⠀`,
+		`⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢹⣿⣿⣿⣿⠘⣿⠃⣿⣿⣿⣿⡏⠀⠀`,
+		`⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⠀⠈⠛⣰⠿⣆⠛⠁⠀⡀⠀⠀⠀`,
+		`⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣼⣿⣦⠀⠘⠛⠋⠀⣴⣿⠁⠀⠀⠀`,
+		`⠀⠀⠀⠀⠀⠀⣀⣤⣶⣾⣿⣿⣿⣿⡇⠀⠀⠀⢸⣿⣏⠀⠀⠀⠀`,
+		`⠀⠀⠀⣠⣶⣿⣿⣿⣿⣿⣿⣿⣿⠿⠿⠀⠀⠀⠾⢿⣿⠀⠀⠀⠀`,
+		`⠀⣠⣿⣿⣿⣿⣿⣿⡿⠟⠋⣁⣠⣤⣤⡶⠶⠶⣤⣄⠈⠀⠀⠀⠀`,
+		`⢰⣿⣿⣮⣉⣉⣉⣤⣴⣶⣿⣿⣋⡥⠄⠀⠀⠀⠀⠉⢻⣄⠀⠀⠀`,
+		`⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣟⣋⣁⣤⣀⣀⣤⣤⣤⣤⣄⣿⡄⠀⠀`,
+		`⠀⠙⠿⣿⣿⣿⣿⣿⣿⣿⡿⠿⠛⠋⠉⠁⠀⠀⠀⠀⠈⠛⠃⠀⠀`,
+		`⠀⠀⠀⠀⠉⠉⠉⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀`,
 	}
 
 	wordmark := []string{
@@ -131,18 +133,24 @@ func renderFullFoxHero(frame int, plain bool) []string {
 		`ANX · DEVELOPER ENVIRONMENT ORCHESTRATOR`,
 	}
 
+	const wordmarkStartRow = 3
 	out := make([]string, len(foxArt))
 	for row := range foxArt {
-		left := renderFoxGradientLine(foxArt[row], row, frame, plain, true)
+		left := renderFoxGradientLine(foxArt[row], row, frame, plain, false)
+		wIdx := row - wordmarkStartRow
+		if wIdx < 0 || wIdx >= len(wordmark) {
+			out[row] = left
+			continue
+		}
 		var right string
-		if row == len(wordmark)-1 {
+		if wIdx == len(wordmark)-1 {
 			if plain {
-				right = wordmark[row]
+				right = wordmark[wIdx]
 			} else {
-				right = foxTaglineStyle.Render(wordmark[row])
+				right = foxTaglineStyle.Render(wordmark[wIdx])
 			}
 		} else {
-			right = renderFoxGradientLine(wordmark[row], row, frame+2, plain, false)
+			right = renderFoxGradientLine(wordmark[wIdx], row, frame+2, plain, false)
 		}
 		out[row] = left + "   " + right
 	}
@@ -150,39 +158,44 @@ func renderFullFoxHero(frame int, plain bool) []string {
 }
 
 func renderCompactFoxCrest(frame int, plain bool) []string {
-	eyeRune := '◈'
-	if !plain && (frame%8 == 0 || frame%8 == 1) {
-		eyeRune = '✦'
-	}
-
-	// Compact low-poly Fox crest (4 lines x 13 cells).
+	// Compact Braille Fox head portrait (7 lines x 15 cells).
 	foxLines := []string{
-		` ◢◣       ◢◣ `,
-		`◢█▀◣▄▄▄▄▄◢▀█◣`,
-		`◥█ ` + string(eyeRune) + `  ▄  ` + string(eyeRune) + ` █◤`,
-		`  ◥██◥▼◤██◤  `,
+		`⢀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡀`,
+		`⣾⠙⠻⢶⣄⡀⠀⠀⠀⢀⣤⠶⠛⠛⡇`,
+		`⢹⣇⠀⠀⣙⣿⣦⣤⣴⣿⣁⠀⠀⣸⠇`,
+		`⠀⠙⣡⣾⣿⣿⣿⣿⣿⣿⣿⣷⣌⠋⠀`,
+		`⠀⣴⣿⣷⣄⡈⢻⣿⡟⢁⣠⣾⣿⣦⠀`,
+		`⠀⢹⣿⣿⣿⣿⠘⣿⠃⣿⣿⣿⣿⡏⠀`,
+		`⠀⠀⣀⠀⠈⠛⣰⠿⣆⠛⠁⠀⡀⠀⠀`,
 	}
 	rightLines := []string{
+		``,
 		`▄▀█ █▄░█ ▀▄▀  ANX`,
 		`█▀█ █░▀█ █░█  Environment Orchestrator`,
 		`━━━━━━━━━━━━  Burgundy · Crimson · Gold`,
 		`Ready · Cross-Platform · Concurrent`,
+		``,
+		``,
 	}
 
 	out := make([]string, len(foxLines))
 	for row := range foxLines {
-		left := renderFoxGradientLine(foxLines[row], row, frame, plain, true)
+		left := renderFoxGradientLine(foxLines[row], row, frame, plain, false)
+		if rightLines[row] == "" {
+			out[row] = left
+			continue
+		}
 		var right string
 		switch {
-		case (row == 1 || row == 2) && !plain:
+		case (row == 2 || row == 3) && !plain:
 			parts := strings.SplitN(rightLines[row], "  ", 2)
 			right = renderFoxGradientLine(parts[0], row, frame+2, false, false) + "  " + foxTaglineStyle.Render(parts[1])
-		case row == 3 && !plain:
+		case row == 4 && !plain:
 			right = foxTaglineStyle.Render(rightLines[row])
 		default:
 			right = renderFoxGradientLine(rightLines[row], row, frame+2, plain, false)
 		}
-		out[row] = left + "  " + right
+		out[row] = left + "   " + right
 	}
 	return out
 }
@@ -208,7 +221,7 @@ func renderFoxGradientLine(line string, row, frame int, plain, accentFace bool) 
 	sb.Grow(len(line) * 4)
 	col := 0
 	for _, r := range line {
-		if r == ' ' {
+		if r == ' ' || r == '\u2800' {
 			sb.WriteRune(r)
 			col++
 			continue

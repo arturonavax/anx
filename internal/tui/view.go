@@ -150,14 +150,14 @@ func (m Model) renderOverview(w, h int) string {
 	var heroSection string
 	bodyH := h
 	switch {
-	case w >= 88 && h >= 22:
+	case w >= 88 && h >= 38:
 		heroInnerW := w - 4
 		heroArt := RenderFoxLogo(heroInnerW, 30, m.logoFrame, noColor)
 		heroLines := strings.Split(heroArt, "\n")
 		heroPanelH := len(heroLines) + 2
 		heroSection = BuildPanel(m.styles, heroLines, w, heroPanelH, true)
 		bodyH = h - heroPanelH
-	case w >= 60 && h >= 14:
+	case w >= 60 && h >= 18:
 		heroInnerW := w - 4
 		heroArt := RenderFoxLogo(heroInnerW, 20, m.logoFrame, noColor)
 		heroLines := strings.Split(heroArt, "\n")

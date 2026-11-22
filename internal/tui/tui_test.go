@@ -1460,8 +1460,8 @@ func TestFoxLogoResponsiveTiersAndBounds(t *testing.T) {
 		minLines  int
 		maxLines  int
 	}{
-		{name: "large", width: 120, height: 36, wantTier: LogoTierFull, minLines: 6, maxLines: 8},
-		{name: "medium", width: 72, height: 22, wantTier: LogoTierCompact, minLines: 3, maxLines: 4},
+		{name: "large", width: 120, height: 36, wantTier: LogoTierFull, minLines: 15, maxLines: 15},
+		{name: "medium", width: 72, height: 22, wantTier: LogoTierCompact, minLines: 7, maxLines: 7},
 		{name: "small", width: 48, height: 14, wantTier: LogoTierMinimal, minLines: 1, maxLines: 1},
 		{name: "narrow-tall", width: 52, height: 36, wantTier: LogoTierMinimal, minLines: 1, maxLines: 1},
 		{name: "wide-short", width: 120, height: 16, wantTier: LogoTierMinimal, minLines: 1, maxLines: 1},
