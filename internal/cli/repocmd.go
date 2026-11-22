@@ -53,17 +53,19 @@ func SetGitAdapterFactoryForTest(fn func() *gittransport.Adapter) func() {
 }
 
 type repoStatusInfo struct {
-	RepoRoot      string `json:"repo_root"`
-	ConfigRepoURL string `json:"config_repo_url,omitempty"`
-	ConfigRef     string `json:"config_ref,omitempty"`
-	Exists        bool   `json:"exists"`
-	HasFiles      bool   `json:"has_files"`
-	HasManifests  bool   `json:"has_manifests"`
-	IsGit         bool   `json:"is_git"`
-	RemoteURL     string `json:"remote_url,omitempty"`
-	Branch        string `json:"branch,omitempty"`
-	Clean         bool   `json:"clean"`
-	Profiles      int    `json:"profiles"`
+	RepoRoot      string                     `json:"repo_root"`
+	ConfigRepoURL string                     `json:"config_repo_url,omitempty"`
+	ConfigRef     string                     `json:"config_ref,omitempty"`
+	Exists        bool                       `json:"exists"`
+	HasFiles      bool                       `json:"has_files"`
+	HasManifests  bool                       `json:"has_manifests"`
+	IsGit         bool                       `json:"is_git"`
+	RemoteURL     string                     `json:"remote_url,omitempty"`
+	Branch        string                     `json:"branch,omitempty"`
+	Clean         bool                       `json:"clean"`
+	Profiles      int                        `json:"profiles"`
+	Revision      string                     `json:"revision,omitempty" yaml:"revision,omitempty"`
+	Tracking      *gittransport.TrackingInfo `json:"tracking,omitempty" yaml:"tracking,omitempty"`
 }
 
 func newRepoCmd(appCtx *AppContext) *cobra.Command {
@@ -146,8 +148,8 @@ func newRepoStatusCmd(appCtx *AppContext) *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			root := appCtx.RepoRoot
-			info := inspectRepoStatus(cmd.Context(), root)
-			info.ConfigRepoURL = resolveConfigRepoURL(appCtx, "")
+			info := inspectRepoStatus(cmd.Context(), root, false)
+			info.ConfigRepoURL = gittransport.NormalizeURL(resolveConfigRepoURL(appCtx, "")).Redacted
 			info.ConfigRef = resolveConfigRef(appCtx, "")
 			if appCtx.Catalog != nil {
 				info.Profiles = len(appCtx.Catalog.ListProfiles())
@@ -183,6 +185,7 @@ func newRepoStatusCmd(appCtx *AppContext) *cobra.Command {
 				if info.IsGit {
 					fmt.Fprintf(w, "  • Git Remote:    %s\n", info.RemoteURL)
 					fmt.Fprintf(w, "  • Git Branch:    %s\n", info.Branch)
+					renderRepoRevision(w, info)
 					cleanBadge := st.Success.Render("clean")
 					if !info.Clean {
 						cleanBadge = st.Warning.Render("uncommitted changes")
@@ -353,37 +356,91 @@ func newRepoUpdateCmd(appCtx *AppContext) *cobra.Command {
 	var (
 		ref    string
 		sshKey string
+		check  bool
 	)
 	cmd := &cobra.Command{
 		Use:   "update",
-		Short: "Fetch and fast-forward updates for the linked Git configuration repository",
-		Args:  cobra.NoArgs,
+		Short: "Check for incoming environment changes or update the checkout",
+		Long: `Fetch and fast-forward the linked Git environment.
+With --check, fetch the current branch's upstream but do not change the working tree, branch or HEAD.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			root := appCtx.RepoRoot
-			if !isDir(filepath.Join(root, ".git")) {
-				return domain.NewExitError(domain.ExitPreflightFailed, fmt.Errorf("%s is not a git repository; nothing to update", root))
+			if !isGitEnvironment(root) {
+				return domain.NewExitError(
+					domain.ExitPreflightFailed, fmt.Errorf("%s is not a Git environment checkout; nothing to update", root))
+			}
+			if check && cmd.Flags().Changed("ref") {
+				return domain.NewExitError(domain.ExitUsageError, errors.New("--check cannot be combined with --ref"))
 			}
 			chosenRef := resolveConfigRef(appCtx, ref)
 			chosenSSHKey := resolveConfigSSHKey(appCtx, sshKey)
 			if appCtx.Flags.DryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "dry-run: would update git repository at %s (ref=%q)\n", root, chosenRef)
+				if check {
+					fmt.Fprintf(cmd.OutOrStdout(), "dry-run: would check for updates at %s without changing the checkout\n", root)
+				} else {
+					fmt.Fprintf(cmd.OutOrStdout(), "dry-run: would update git repository at %s (ref=%q)\n", root, chosenRef)
+				}
 				return nil
 			}
+			if appCtx.Flags.Offline {
+				return domain.NewExitError(
+					domain.ExitPreflightFailed, errors.New("cannot fetch in offline mode; use 'anx repo status' for cached revisions"))
+			}
 			adapter := newGitAdapter()
-			if err := adapter.UpdateWithOptions(cmd.Context(), gittransport.UpdateOptions{
+			opts := gittransport.UpdateOptions{
 				Dir:    root,
 				Ref:    chosenRef,
 				SSHKey: chosenSSHKey,
-			}); err != nil {
+			}
+			if check {
+				return checkRepoUpdate(cmd, appCtx, adapter, opts)
+			}
+			ctx := cmd.Context()
+			if opts.Ref == "" {
+				if remote, err := adapter.TrackingRemote(ctx, root); err == nil {
+					opts.Remote = remote
+				}
+			}
+			before, _ := adapter.LocalRevision(ctx, root, "HEAD")
+			if err := adapter.UpdateWithOptions(ctx, opts); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Updated configuration repository at %s\n", root)
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "Updated configuration repository at %s\n", root)
+			after, _ := adapter.LocalRevision(ctx, root, "HEAD")
+			if after != "" {
+				fmt.Fprintf(out, "Environment revision: %s\n", after)
+			}
+			if before != "" && after != "" && before != after {
+				if paths, err := adapter.ChangedEnvironmentPaths(ctx, root, before, after); err == nil {
+					renderEnvironmentPaths(out, "Changed environment paths", paths)
+				}
+				fmt.Fprintln(out, "Run 'anx plan' before applying the updated environment.")
+			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&ref, "ref", "", "Optional branch, tag, or commit to checkout")
 	cmd.Flags().StringVar(&sshKey, "ssh-key", "", "Path to SSH private key for private Git repositories")
+	cmd.Flags().BoolVar(&check, "check", false, "Fetch and report incoming changes without modifying the checkout")
 	return cmd
+}
+
+func checkRepoUpdate(cmd *cobra.Command, appCtx *AppContext, adapter *gittransport.Adapter, opts gittransport.UpdateOptions) error {
+	ctx := cmd.Context()
+	if err := adapter.RefreshTracking(ctx, opts); err != nil {
+		return domain.NewExitError(domain.ExitPreflightFailed, fmt.Errorf(
+			"cannot check for updates: %w; use 'anx repo status' to see the current revision", err))
+	}
+	info := inspectRepoStatus(ctx, opts.Dir, true)
+	if info.Tracking == nil {
+		return domain.NewExitError(domain.ExitPreflightFailed, errors.New("Git did not resolve an upstream revision after fetching"))
+	}
+	return emit(cmd, appCtx, info, func(w io.Writer) {
+		fmt.Fprintln(w, "Environment update check (checkout unchanged)")
+		renderRepoRevision(w, info)
+	})
 }
 
 type repoVerifyReport struct {
@@ -521,28 +578,62 @@ func persistRepoSSHKey(configDir, sshKey string) error {
 	return os.WriteFile(cfgPath, out, 0o644)
 }
 
-func inspectRepoStatus(ctx context.Context, root string) repoStatusInfo {
+func inspectRepoStatus(ctx context.Context, root string, withPaths bool) repoStatusInfo {
 	info := repoStatusInfo{
 		RepoRoot:     root,
 		Exists:       isDir(root),
 		HasFiles:     isDir(filepath.Join(root, "files")),
 		HasManifests: isDir(filepath.Join(root, "manifests")),
-		IsGit:        isDir(filepath.Join(root, ".git")),
+		IsGit:        isGitEnvironment(root),
 	}
 
 	if info.IsGit {
-		if out, err := exec.CommandContext(ctx, "git", "-C", root, "remote", "get-url", "origin").Output(); err == nil {
-			info.RemoteURL = strings.TrimSpace(string(out))
+		adapter := newGitAdapter()
+		if origin, err := adapter.LocalOrigin(ctx, root); err == nil {
+			info.RemoteURL = gittransport.NormalizeURL(origin).Redacted
+		}
+		if head, err := adapter.LocalRevision(ctx, root, "HEAD"); err == nil && head != "" {
+			info.Revision = head
+			info.Tracking, _ = adapter.LocalTracking(ctx, root, head, withPaths)
 		}
 		if out, err := exec.CommandContext(ctx, "git", "-C", root, "branch", "--show-current").Output(); err == nil {
 			info.Branch = strings.TrimSpace(string(out))
 		}
-		if out, err := exec.CommandContext(ctx, "git", "-C", root, "status", "--porcelain").Output(); err == nil {
+		if out, err := exec.CommandContext(ctx,
+			"git", "--no-optional-locks", "-C", root, "status", "--porcelain").Output(); err == nil {
 			info.Clean = len(strings.TrimSpace(string(out))) == 0
 		}
 	}
 
 	return info
+}
+
+func isGitEnvironment(root string) bool {
+	if root == "" || (!isDir(filepath.Join(root, "manifests")) && !isDir(filepath.Join(root, "files"))) {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(root, ".git"))
+	return err == nil && (info.IsDir() || info.Mode().IsRegular())
+}
+
+func renderRepoRevision(w io.Writer, info repoStatusInfo) {
+	if info.Revision != "" {
+		fmt.Fprintf(w, "  • Git Revision:  %s\n", info.Revision)
+	}
+	if tracking := info.Tracking; tracking != nil {
+		fmt.Fprintf(w, "  • Cached upstream: %s (ahead %d, behind %d)\n",
+			tracking.UpstreamRevision, tracking.Ahead, tracking.Behind)
+		if tracking.IncomingPathsKnown {
+			renderEnvironmentPaths(w, "Incoming environment paths", tracking.IncomingPaths)
+		}
+	}
+}
+
+func renderEnvironmentPaths(w io.Writer, label string, paths []string) {
+	fmt.Fprintf(w, "%s (%d):\n", label, len(paths))
+	for _, path := range paths {
+		fmt.Fprintf(w, "  - %q\n", path)
+	}
 }
 
 func ensureDotfilesRepo(cmd *cobra.Command, appCtx *AppContext) error {

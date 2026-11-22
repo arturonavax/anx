@@ -606,6 +606,7 @@ type UpdateOptions struct {
 	Dir    string
 	Ref    string
 	SSHKey string
+	Remote string
 }
 
 // LocalOrigin reads the configured origin without applying Git's URL rewrites.
@@ -631,12 +632,17 @@ func (a *Adapter) LocalRevision(ctx context.Context, dir, ref string) (string, e
 }
 
 func (a *Adapter) readLocalValue(ctx context.Context, dir string, args ...string) (string, error) {
+	out, err := a.readLocalOutput(ctx, dir, args...)
+	return strings.TrimSpace(out), err
+}
+
+func (a *Adapter) readLocalOutput(ctx context.Context, dir string, args ...string) (string, error) {
 	runner := a.Runner
 	if runner == nil {
 		runner = execRunner{}
 	}
 	out, _, err := runner.Run(ctx, NonInteractiveEnv(), dir, "git", args...)
-	return strings.TrimSpace(out), err
+	return out, err
 }
 
 // PushOptions binds a branch and verified origin URL to a push.
@@ -720,6 +726,21 @@ func (a *Adapter) Update(ctx context.Context, dir, ref string) error {
 	})
 }
 
+func (a *Adapter) fetchOrigin(ctx context.Context, opts UpdateOptions, env []string) error {
+	runner := a.Runner
+	if runner == nil {
+		runner = execRunner{}
+	}
+	remote := opts.Remote
+	if remote == "" {
+		remote = "origin"
+	}
+	if _, stderr, err := runner.Run(ctx, env, opts.Dir, "git", "fetch", "--prune", "--", remote); err != nil {
+		return classifyGitError(opts.Dir, opts.Ref, "git", stderr, err)
+	}
+	return nil
+}
+
 // UpdateWithOptions fetches and fast-forwards an existing Git checkout using optional explicit SSH key.
 func (a *Adapter) UpdateWithOptions(ctx context.Context, opts UpdateOptions) error {
 	runner := a.Runner
@@ -738,8 +759,8 @@ func (a *Adapter) UpdateWithOptions(ctx context.Context, opts UpdateOptions) err
 		return err
 	}
 
-	if _, stderr, err := runner.Run(uCtx, env, opts.Dir, "git", "fetch", "--prune", "origin"); err != nil {
-		return classifyGitError(opts.Dir, opts.Ref, "git", stderr, err)
+	if err := a.fetchOrigin(uCtx, opts, env); err != nil {
+		return err
 	}
 	targetRef := strings.TrimSpace(opts.Ref)
 	if targetRef != "" {

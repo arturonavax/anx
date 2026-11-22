@@ -121,6 +121,7 @@ For example, `distros: [debian, ubuntu]` matches those distribution IDs and
 anx repo status
 anx repo clone [url] [--ref <ref>] [--auth auto|ssh|https]
 anx repo set <path-or-url> [--ref <ref>]
+anx repo update --check
 anx repo update
 anx repo verify
 
@@ -151,6 +152,14 @@ enrollment prefers SSH when available. For a private SSH origin, configure
 `ANX_SSH_KEY` or the key saved by `anx repo clone --ssh-key`, and establish
 the server's host key before pushing. The capture commit excludes unrelated
 staged changes. Offline and dry-run modes do not push.
+
+`anx repo status` reports the checked-out Git revision and cached upstream
+without fetching. `anx repo update --check` refreshes the current branch's
+tracking refs and lists incoming manifest, dotfile, and script paths without
+changing the branch, index, or working tree. It requires a tracking branch;
+a pinned detached checkout still reports its revision in `repo status`.
+Use `anx repo update` to update explicitly, then `anx plan` to review what ANX
+would apply. Updating Git does not apply packages or dotfiles automatically.
 
 ## Security & Git Authentication
 
