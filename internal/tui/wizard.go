@@ -11,6 +11,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/arturonavax/anx/internal/app"
 	"github.com/arturonavax/anx/internal/catalog"
 	"github.com/arturonavax/anx/internal/domain"
@@ -2070,11 +2071,10 @@ func (w WizardModel) renderWorkerOutputBox(slot activeWorkerSlot, width int) []s
 	if len(outputs) == 0 {
 		outputs = []string{"Preparing operation..."}
 	}
-	lines := wizardLogBox(width, "   ", "["+slot.ResourceID+"] output", "> ", outputs, 3)
-	for i, line := range lines {
-		lines[i] = w.styles.Muted.Render(line)
-	}
-	return lines
+	return wizardLogBox(width, outputs, wizardLogPanel{
+		indent: "   ", title: "[" + slot.ResourceID + "] output", prefix: "> ", limit: 3,
+		border: w.styles.Muted, body: lipgloss.NewStyle().Foreground(w.styles.Palette.Foreground),
+	})
 }
 
 func (w WizardModel) renderGlobalOutputBox(width int) []string {
@@ -2082,38 +2082,76 @@ func (w WizardModel) renderGlobalOutputBox(width int) []string {
 	if len(recent) == 0 {
 		recent = []string{"Initializing deployment operations..."}
 	}
-	lines := wizardLogBox(width, "  ", "LIVE PROGRESS OUTPUT STREAM", "", recent, 6)
-	for i, line := range lines {
-		if i == 0 || i == len(lines)-1 {
-			lines[i] = w.styles.Header.Render(line)
-		} else {
-			lines[i] = w.styles.Muted.Render(line)
-		}
-	}
-	return lines
+	return wizardLogBox(width, recent, wizardLogPanel{
+		indent: "  ", title: "LIVE PROGRESS OUTPUT STREAM", limit: 6,
+		border: w.styles.Header, body: lipgloss.NewStyle().Foreground(w.styles.Palette.Foreground),
+	})
 }
 
-func wizardLogBox(width int, indent, title, prefix string, output []string, limit int) []string {
+type wizardLogPanel struct {
+	indent, title, prefix string
+	limit                 int
+	border, body          lipgloss.Style
+}
+
+func wizardLogBox(width int, output []string, p wizardLogPanel) []string {
 	// renderApplying reserves four columns when wrapping the page.
-	boxWidth := width - 4 - len(indent)
-	textWidth := boxWidth - len(prefix) - 4 // Two borders and two spaces.
+	boxWidth := width - 4 - len(p.indent)
+	textWidth := boxWidth - len(p.prefix) - 4 // Two borders and two spaces.
 	if textWidth < 1 {
 		return nil
 	}
 
-	label := AnsiTruncate("─ "+title+" ", boxWidth-2)
-	top := indent + "┌" + label + strings.Repeat("─", boxWidth-2-ansi.StringWidth(label)) + "┐"
-	lines := []string{top}
-	for _, raw := range output[max(0, len(output)-limit):] {
+	label := AnsiTruncate("─ "+p.title+" ", boxWidth-2)
+	top := "┌" + label + strings.Repeat("─", boxWidth-2-ansi.StringWidth(label)) + "┐"
+	lines := []string{p.indent + p.border.Render(top)}
+	side := p.border.Render("│")
+	for _, raw := range output[max(0, len(output)-p.limit):] {
 		// Terminal tab stops depend on the column; use fixed spaces before measuring.
 		raw = strings.ReplaceAll(raw, "\t", "    ")
 		for _, row := range AnsiWrap(raw, textWidth) {
 			row = AnsiTruncate(row, textWidth)
 			padding := strings.Repeat(" ", textWidth-ansi.StringWidth(row))
-			lines = append(lines, indent+"│ "+prefix+row+padding+" │")
+			lines = append(lines, p.indent+side+" "+p.body.Render(p.prefix+row)+padding+" "+side)
 		}
 	}
-	return append(lines, indent+"└"+strings.Repeat("─", boxWidth-2)+"┘")
+	return append(lines, p.indent+p.border.Render("└"+strings.Repeat("─", boxWidth-2)+"┘"))
+}
+
+func (w WizardModel) renderActiveWorkerRows(width int, frames []string) []string {
+	available := width - 4
+	rows := make([]string, 0, len(w.activeWorkerOrder))
+	details := make([]string, 0)
+	text := lipgloss.NewStyle().Foreground(w.styles.Palette.Foreground)
+	singleLine := strings.NewReplacer("\n", " ", "\r", " ", "\t", "    ")
+	for _, id := range w.activeWorkerOrder {
+		slot := w.activeWorkers[id]
+		frame := w.spinnerFrame + id
+		action := strings.ToUpper(slot.Action)
+		if action == "" {
+			action = "INSTALL"
+		}
+		label := fmt.Sprintf("   %s %s %s",
+			w.styles.Header.Render(frames[frame%len(frames)]),
+			w.styles.Success.Render("["+action+"]"),
+			w.styles.Highlight.Render(slot.ResourceID),
+		)
+		bar := w.renderWorkerIndividualBar(slot, frame, 12)
+		row := AnsiTruncate(label, available-ansi.StringWidth(bar)-1) + " " + bar
+		if len(w.activeWorkers) > 1 && len(slot.Outputs) > 0 {
+			latest := slot.Outputs[len(slot.Outputs)-1]
+			latest = singleLine.Replace(latest)
+			room := available - ansi.StringWidth(row) - 2
+			if room >= 12 {
+				row += "  " + text.Render(AnsiTruncate(latest, room))
+			} else {
+				line := fmt.Sprintf("   [%s] %s", slot.ResourceID, latest)
+				details = append(details, text.Render(AnsiTruncate(line, available)))
+			}
+		}
+		rows = append(rows, row)
+	}
+	return append(rows, details...)
 }
 
 func (w WizardModel) renderApplying(width int, height ...int) string {
@@ -2154,30 +2192,14 @@ func (w WizardModel) renderApplying(width int, height ...int) string {
 	}
 
 	if len(w.activeWorkers) > 0 {
-		lines = append(lines, "", fmt.Sprintf("  %s", w.styles.Header.Render(fmt.Sprintf("CONCURRENT WORKERS (%d executing in parallel):", len(w.activeWorkers)))))
-		maxWorkersToShow := 3
-		for i, id := range w.activeWorkerOrder {
-			if i >= maxWorkersToShow {
-				remaining := len(w.activeWorkerOrder) - maxWorkersToShow
-				lines = append(lines, fmt.Sprintf("   %s", w.styles.Muted.Render(fmt.Sprintf("... and %d more workers in flight", remaining))))
-				break
-			}
-			slot := w.activeWorkers[id]
-			wSpinner := frames[(w.spinnerFrame+id)%len(frames)]
-			act := strings.ToUpper(slot.Action)
-			if act == "" {
-				act = "INSTALL"
-			}
-			indivBar := w.renderWorkerIndividualBar(slot, w.spinnerFrame+id, 12)
-			lines = append(lines, fmt.Sprintf("   %s %s %s %s",
-				w.styles.Header.Render(wSpinner),
-				w.styles.Success.Render("["+act+"]"),
-				w.styles.Highlight.Render(slot.ResourceID),
-				indivBar,
-			))
-			// Render individual worker output widget
-			wBox := w.renderWorkerOutputBox(slot, width)
-			lines = append(lines, wBox...)
+		heading := "ACTIVE WORKER (1 running):"
+		if len(w.activeWorkers) > 1 {
+			heading = fmt.Sprintf("CONCURRENT WORKERS (%d executing in parallel):", len(w.activeWorkers))
+		}
+		lines = append(lines, "", "  "+w.styles.Header.Render(heading))
+		lines = append(lines, w.renderActiveWorkerRows(width, frames)...)
+		if len(w.activeWorkerOrder) == 1 {
+			lines = append(lines, w.renderWorkerOutputBox(w.activeWorkers[w.activeWorkerOrder[0]], width)...)
 		}
 	} else {
 		desc := w.progressDesc

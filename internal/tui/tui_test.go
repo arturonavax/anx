@@ -1200,6 +1200,57 @@ func TestWizardApplyingLogBoxesKeepAlignedBorders(t *testing.T) {
 	}
 }
 
+func TestWizardLiveLogBorderUsesTheSameStyleOnAllSides(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	deps := newTestDeps(t)
+	w := NewWizardModel(deps.Platform, deps.Catalog, nil)
+	w.recentOutputLines = []string{"[example] Downloading"}
+
+	box := w.renderGlobalOutputBox(80)
+	if len(box) != 3 {
+		t.Fatalf("expected one log row and two edges, got %q", box)
+	}
+	accent := w.styles.Header.Render("│")
+	if accent == "│" || strings.Count(box[1], accent) != 2 {
+		t.Errorf("expected matching accent borders around the log row, got %q", box[1])
+	}
+}
+
+func TestWizardShowsEveryActiveWorkerBarAndLatestOutput(t *testing.T) {
+	deps := newTestDeps(t)
+	w := NewWizardModel(deps.Platform, deps.Catalog, nil)
+	w.stage = StageApplying
+	w.width, w.height = 110, 20
+	for i := 1; i <= 5; i++ {
+		nm, _ := w.Update(wizardProgressMsg{
+			StepID: i, ResourceID: fmt.Sprintf("worker-%d", i), Status: domain.StepRunning,
+			OutputLine: fmt.Sprintf("log-%d", i), Action: "install",
+		})
+		w = nm.(WizardModel)
+	}
+	rows := strings.Split(ansi.Strip(w.View().Content), "\n")
+	for i := 1; i <= 5; i++ {
+		worker := fmt.Sprintf("worker-%d", i)
+		log := fmt.Sprintf("log-%d", i)
+		found := false
+		for _, row := range rows {
+			if strings.Contains(row, worker+" [") && strings.Contains(row, log) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s has no visible bar and latest log", worker)
+		}
+	}
+	w.width = 50
+	narrow := ansi.Strip(w.View().Content)
+	for i := 1; i <= 5; i++ {
+		if !strings.Contains(narrow, fmt.Sprintf("worker-%d [", i)) {
+			t.Errorf("narrow viewport hides worker-%d's bar", i)
+		}
+	}
+}
+
 func TestWizardScrollingInApplyingAndCompletedStages(t *testing.T) {
 	deps := newTestDeps(t)
 	wiz := NewWizardModel(deps.Platform, deps.Catalog, nil)
