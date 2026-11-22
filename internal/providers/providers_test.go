@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/arturonavax/anx/internal/domain"
+	"github.com/arturonavax/anx/internal/gittransport"
 	"github.com/arturonavax/anx/internal/manifest"
 	"github.com/arturonavax/anx/internal/testutil"
 	"github.com/arturonavax/anx/internal/platform"
@@ -1054,4 +1056,86 @@ cat "` + installerSrc + `" > "$out"
 			t.Fatalf("expected zsh-plugins IsInstalled=false when fast-syntax-highlighting missing, got ok=%v err=%v", ok, err)
 		}
 	})
+}
+
+func TestSourceStrategyUsesGitTransport(t *testing.T) {
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	plat := platform.NewTestInfo(platform.TestInfoParams{
+		OS:          runtime.GOOS,
+		Arch:        runtime.GOARCH,
+		HomeDir:     home,
+		LocalBinDir: binDir,
+	})
+
+	// 1. Non-existent local repo path must surface a typed *gittransport.TransportError.
+	missingPath := filepath.Join(t.TempDir(), "does-not-exist")
+	dropIn := t.TempDir()
+	missingYAML := `packages:
+  - id: missing-src
+    name: Missing Source
+    category: test
+    strategies:
+      - type: source
+        source:
+          git_url: "` + filepath.ToSlash(missingPath) + `"
+          steps:
+            - ["true"]
+`
+	if err := os.WriteFile(filepath.Join(dropIn, "missing.yaml"), []byte(missingYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cat, err := manifest.LoadCatalog(manifest.WithUserDropInDir(dropIn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	disp := providers.NewDispatcher(plat, cat, security.NewRunner(5*time.Second), "")
+	err = disp.Install(context.Background(), domain.ManagedResource{ID: "missing-src", Name: "Missing Source"})
+	if err == nil {
+		t.Fatal("expected error for missing local source path")
+	}
+	var tErr *gittransport.TransportError
+	if !errors.As(err, &tErr) {
+		t.Fatalf("expected *gittransport.TransportError, got %T: %v", err, err)
+	}
+	if tErr.Kind != gittransport.ErrKindNotFound {
+		t.Fatalf("TransportError.Kind = %q, want %q", tErr.Kind, gittransport.ErrKindNotFound)
+	}
+
+	// 2. Local source directory is staged via gittransport and built inside temp checkout.
+	if runtime.GOOS == "windows" {
+		return
+	}
+	localSrc := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localSrc, "version.txt"), []byte("3.1.4"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outMarker := filepath.Join(home, "built-version.txt")
+	okDropIn := t.TempDir()
+	okYAML := `packages:
+  - id: local-src-tool
+    name: Local Source Tool
+    category: test
+    strategies:
+      - type: source
+        source:
+          git_url: "` + localSrc + `"
+          steps:
+            - ["sh", "-c", "cp version.txt '` + outMarker + `'"]
+`
+	if err := os.WriteFile(filepath.Join(okDropIn, "ok.yaml"), []byte(okYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	okCat, err := manifest.LoadCatalog(manifest.WithUserDropInDir(okDropIn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	okDisp := providers.NewDispatcher(plat, okCat, security.NewRunner(5*time.Second), "")
+	if err := okDisp.Install(context.Background(), domain.ManagedResource{ID: "local-src-tool", Name: "Local Source Tool"}); err != nil {
+		t.Fatalf("local source install failed: %v", err)
+	}
+	got, err := os.ReadFile(outMarker)
+	if err != nil || string(got) != "3.1.4" {
+		t.Fatalf("built marker = %q, err = %v", string(got), err)
+	}
 }

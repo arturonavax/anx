@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -288,21 +289,35 @@ func runSystemUninstall(cmd *cobra.Command, appCtx *AppContext, purge bool) erro
 	}
 
 	repo := appCtx.RepoRoot
-	if appCtx.Platform.OS() == "windows" {
+	if runtime.GOOS == "windows" || appCtx.Platform.OS() == "windows" {
 		psScript := filepath.Join(repo, "scripts", "uninstall_anx.ps1")
 		if isFile(psScript) {
+			shellBin, err := exec.LookPath("pwsh")
+			if err != nil {
+				shellBin, err = exec.LookPath("powershell.exe")
+			}
+			if err != nil {
+				return fmt.Errorf("cannot run %s: neither pwsh nor powershell.exe found in PATH", psScript)
+			}
 			args := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", psScript, "-Yes"}
 			if purge {
 				args = append(args, "-PurgeConfigs")
 			}
-			c := exec.CommandContext(ctx, "powershell.exe", args...)
+			c := exec.CommandContext(ctx, shellBin, args...)
 			c.Stdout, c.Stderr = out, cmd.ErrOrStderr()
 			return c.Run()
 		}
 	} else {
 		shScript := filepath.Join(repo, "uninstall.sh")
 		if isFile(shScript) {
-			c := exec.CommandContext(ctx, "bash", shScript)
+			shellBin, err := exec.LookPath("bash")
+			if err != nil {
+				shellBin, err = exec.LookPath("sh")
+			}
+			if err != nil {
+				return fmt.Errorf("cannot run %s: no POSIX shell (bash/sh) available on %s", shScript, runtime.GOOS)
+			}
+			c := exec.CommandContext(ctx, shellBin, shScript)
 			c.Stdout, c.Stderr = out, cmd.ErrOrStderr()
 			return c.Run()
 		}

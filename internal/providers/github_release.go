@@ -17,10 +17,13 @@ import (
 	"time"
 
 	"github.com/arturonavax/anx/internal/manifest"
+	"github.com/arturonavax/anx/internal/platform"
 	"github.com/arturonavax/anx/internal/security"
 )
 
 const maxExtractedFileBytes = 512 * 1024 * 1024 // 512 MB per archive entry cap
+
+var githubReleaseHTTPClient = platform.NewHTTPClient(30 * time.Second)
 
 type githubReleaseAPIResponse struct {
 	TagName string `json:"tag_name"`
@@ -174,7 +177,7 @@ func (d *Dispatcher) resolveGitHubAssetURL(
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := githubReleaseHTTPClient.Do(req)
 	if err != nil {
 		return "", "", fmt.Errorf("querying GitHub release metadata for %s: %w", rel.Repo, err)
 	}
@@ -265,7 +268,7 @@ func (d *Dispatcher) installExtractedDirectory(extractDir string, rel manifest.G
 			return err
 		}
 		_ = os.Remove(linkPath)
-		if err := os.Symlink(linkTarget, linkPath); err != nil {
+		if err := platform.LinkOrCopy(linkTarget, linkPath); err != nil {
 			return copyFileAtomic(linkTarget, linkPath, 0o755)
 		}
 	}
@@ -337,7 +340,7 @@ func extractTarArchive(archivePath, destDir, compression string) error {
 				return err
 			}
 			_ = os.Remove(destPath)
-			if err := os.Symlink(hdr.Linkname, destPath); err != nil {
+			if err := platform.LinkOrCopy(hdr.Linkname, destPath); err != nil {
 				return err
 			}
 		}

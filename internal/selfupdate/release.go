@@ -9,7 +9,12 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
+
+	"github.com/arturonavax/anx/internal/platform"
 )
+
+var defaultReleaseHTTPClient = platform.NewHTTPClient(30 * time.Second)
 
 // Release artifact naming contract, shared with the release pipeline and the installers.
 const (
@@ -111,7 +116,7 @@ func (g GitHubSource) client() *http.Client {
 	if g.Client != nil {
 		return g.Client
 	}
-	return http.DefaultClient
+	return defaultReleaseHTTPClient
 }
 
 // Latest implements Source.

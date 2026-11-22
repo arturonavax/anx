@@ -37,3 +37,24 @@ func TestDeployerAtomicCopy(t *testing.T) {
 		t.Fatalf("expected 'atomic deploy test', got '%s'", string(content))
 	}
 }
+
+func TestDeployerSymlinkMode(t *testing.T) {
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(src, []byte("theme = 'fox'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(tempDir, "linked", "config.toml")
+
+	deployer := configsync.NewDeployer()
+	if err := deployer.Deploy(src, dst, configsync.ModeSymlink); err != nil {
+		t.Fatalf("ModeSymlink deploy failed: %v", err)
+	}
+	content, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("reading linked file: %v", err)
+	}
+	if string(content) != "theme = 'fox'\n" {
+		t.Fatalf("content = %q, want %q", string(content), "theme = 'fox'\n")
+	}
+}

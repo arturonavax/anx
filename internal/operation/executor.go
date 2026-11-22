@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/arturonavax/anx/internal/platform"
 )
 
 // GoExecutor executes typed IR operations natively without shell wrapper processes.
@@ -153,7 +155,7 @@ func (e *GoExecutor) ExecuteOp(ctx context.Context, op Operation) error {
 		if err := os.MkdirAll(filepath.Dir(cleanTarget), 0755); err != nil {
 			return err
 		}
-		if err := os.Symlink(op.SourcePath, cleanTarget); err != nil {
+		if err := platform.LinkOrCopy(op.SourcePath, cleanTarget); err != nil {
 			return fmt.Errorf("symlink %s -> %s: %w", cleanTarget, op.SourcePath, err)
 		}
 

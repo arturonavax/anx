@@ -2,6 +2,7 @@ package security
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -56,6 +57,9 @@ func SudoCleanEnv(base []string) []string {
 // Before invoking sudo, it repairs any missing user-space PAM module referenced in sudo_local so
 // pam_start() does not fail with "sudo: unable to initialize PAM: No such file or directory".
 func IsSudoAuthenticated() bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
 	_, _ = EnsureSudoPAMHealthy()
 	cmd := exec.Command("sudo", "-n", "true")
 	cmd.Env = SudoCleanEnv(os.Environ())
@@ -119,6 +123,13 @@ exec sudo -p "$prompt" -v`
 // Touch ID is never required: a failed/cancelled biometric prompt falls back to the password,
 // and missing user-space PAM modules in /etc/pam.d/sudo_local are shimmed before sudo starts.
 func NewSudoAuthCmd() *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("cmd", "/c", "echo sudo authentication is not supported on Windows >&2 && exit 1")
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd
+	}
 	_, _ = EnsureSudoPAMHealthy()
 	cmd := exec.Command("sh", "-c", sudoAuthScript)
 	cmd.Env = SudoCleanEnv(os.Environ())
@@ -131,6 +142,9 @@ func NewSudoAuthCmd() *exec.Cmd {
 // AuthenticateSudoCLI executes an interactive sudo credential refresh in the controlling terminal.
 // It ensures that no graphical authentication dialog (Polkit GUI, pinentry, askpass) is ever spawned.
 func AuthenticateSudoCLI() error {
+	if runtime.GOOS == "windows" {
+		return errors.New("sudo authentication is not supported on Windows; run from an elevated terminal")
+	}
 	_, _ = EnsureSudoPAMHealthy()
 	cmd := NewSudoAuthCmd()
 	if err := cmd.Run(); err != nil {
@@ -472,6 +486,9 @@ func PrepareSudoLocalForPurge(ctx context.Context) (bool, error) {
 // using "sudo -n -v" so that credentials do not expire during long installation processes.
 // It returns a cancel/stop function.
 func StartSudoKeepalive(ctx context.Context) func() {
+	if runtime.GOOS == "windows" {
+		return func() {}
+	}
 	stopCh := make(chan struct{})
 	var once sync.Once
 

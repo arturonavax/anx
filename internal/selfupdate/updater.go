@@ -15,7 +15,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/arturonavax/anx/internal/platform"
 )
+
+var defaultUpdaterHTTPClient = platform.NewHTTPClient(5 * time.Minute)
 
 // Planning and apply errors.
 var (
@@ -109,7 +114,7 @@ type Result struct {
 func New(build BuildInfo, execPath string, src Source) *Updater {
 	return &Updater{
 		Source:   src,
-		Client:   http.DefaultClient,
+		Client:   defaultUpdaterHTTPClient,
 		Build:    build,
 		ExecPath: execPath,
 		GOOS:     runtime.GOOS,
@@ -420,7 +425,7 @@ func (u *Updater) get(ctx context.Context, rawURL string) (*http.Response, error
 
 	client := u.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultUpdaterHTTPClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {

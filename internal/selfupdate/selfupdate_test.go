@@ -392,6 +392,23 @@ func TestUpdaterRollbackOnSelfTestFailure(t *testing.T) {
 	}
 }
 
+func TestUpdaterUsesPooledHTTPClientByDefault(t *testing.T) {
+	u := selfupdate.New(selfupdate.BuildInfo{Version: "v1.0.0", Origin: selfupdate.OriginRelease}, "/tmp/anx", &fakeSource{})
+	if u.Client == nil {
+		t.Fatal("expected non-nil default HTTP client")
+	}
+	if u.Client == http.DefaultClient {
+		t.Fatal("expected pooled HTTP client, got http.DefaultClient")
+	}
+	tr, ok := u.Client.Transport.(*http.Transport)
+	if !ok || tr == nil {
+		t.Fatalf("expected *http.Transport, got %T", u.Client.Transport)
+	}
+	if tr.MaxIdleConnsPerHost != 16 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want 16", tr.MaxIdleConnsPerHost)
+	}
+}
+
 type fakeSource struct {
 	rel selfupdate.Release
 	err error

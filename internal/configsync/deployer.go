@@ -7,9 +7,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 
+	"github.com/arturonavax/anx/internal/platform"
 	"github.com/arturonavax/anx/internal/security"
 )
 
@@ -46,18 +46,7 @@ func (d *Deployer) Deploy(source, target string, mode DeployMode) error {
 	}
 
 	if mode == ModeSymlink {
-		err := d.deploySymlink(source, target)
-		if err == nil {
-			return nil
-		}
-		if runtime.GOOS == "windows" {
-			if info.IsDir() {
-				_, syncErr := d.SyncDirectory(source, target, nil)
-				return syncErr
-			}
-			return d.deployAtomicFile(source, target)
-		}
-		return err
+		return d.deploySymlink(source, target)
 	}
 
 	if info.IsDir() {
@@ -180,7 +169,7 @@ func (d *Deployer) deploySymlink(source, target string) error {
 		}
 	}
 
-	return os.Symlink(absSource, target)
+	return platform.LinkOrCopy(absSource, target)
 }
 
 func (d *Deployer) deployAtomicFile(source, target string) error {

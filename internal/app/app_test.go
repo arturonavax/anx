@@ -1200,3 +1200,14 @@ func TestInstallServicePlanOrdersOSConfigLastAndRequiresSudoOnDarwin(t *testing.
 		t.Errorf("expected PlanRequiresSudo=true for darwin plan containing macos-osconfig-script")
 	}
 }
+
+func TestInstallLogPathUsesUserHomeDirFallback(t *testing.T) {
+	svc := app.NewInstallService(app.InstallDeps{})
+	logPath := svc.InstallLogPath()
+	if logPath == "" {
+		t.Fatal("InstallLogPath() returned empty path")
+	}
+	if filepath.Base(logPath) != "install.log" {
+		t.Fatalf("InstallLogPath() = %q, want basename install.log", logPath)
+	}
+}

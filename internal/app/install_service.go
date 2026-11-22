@@ -90,7 +90,11 @@ func (s *InstallService) InstallLogPath() string {
 	if s.platform != nil && s.platform.StateDir() != "" {
 		return filepath.Join(s.platform.StateDir(), "logs", "install.log")
 	}
-	return filepath.Join(os.Getenv("HOME"), ".local", "state", "anx", "logs", "install.log")
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join(os.TempDir(), "anx", "logs", "install.log")
+	}
+	return filepath.Join(home, ".local", "state", "anx", "logs", "install.log")
 }
 
 // StrategyDependencyResolver optionally provides host-specific winning strategy and dependency selection.

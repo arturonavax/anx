@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/arturonavax/anx/internal/gittransport"
 	"github.com/arturonavax/anx/internal/manifest"
 	"github.com/arturonavax/anx/internal/security"
 )
@@ -33,24 +34,27 @@ func (d *Dispatcher) installFromSource(ctx context.Context, src manifest.SourceS
 	defer os.RemoveAll(tmpDir)
 
 	repoCheckout := filepath.Join(tmpDir, "src")
-	cloneArgs := []string{"clone", "--depth", "1"}
-	if strings.TrimSpace(src.Ref) != "" {
-		cloneArgs = append(cloneArgs, "--branch", strings.TrimSpace(src.Ref))
-	}
-	cloneArgs = append(cloneArgs, strings.TrimSpace(src.GitURL), repoCheckout)
+	cloneCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
 
-	env := d.buildSubprocessEnv(src.Env)
-	if _, err := d.runner.RunWithInput(
-		ctx,
-		security.RunOptions{
-			Env:     env,
-			Timeout: 10 * time.Minute,
-		},
-		"git",
-		cloneArgs...,
-	); err != nil {
+	adapter := gittransport.NewAdapter()
+	probe, err := adapter.Clone(cloneCtx, gittransport.CloneOptions{
+		URL:   strings.TrimSpace(src.GitURL),
+		Ref:   strings.TrimSpace(src.Ref),
+		Dest:  repoCheckout,
+		Depth: 1,
+		Auth:  gittransport.AuthAuto,
+	})
+	if err != nil {
 		return fmt.Errorf("cloning %s: %w", src.GitURL, err)
 	}
+	if probe.Transport == "local" {
+		if err := copyDirectoryRecursive(probe.ResolvedURL, repoCheckout); err != nil {
+			return fmt.Errorf("staging local source %s: %w", src.GitURL, err)
+		}
+	}
+
+	env := d.buildSubprocessEnv(src.Env)
 
 	for idx, rawStep := range src.Steps {
 		if len(rawStep) == 0 {

@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -270,5 +271,121 @@ func TestEngineWithContinueOnError(t *testing.T) {
 	}
 	if results[2].Status != domain.StepSuccess {
 		t.Fatalf("expected step 3 to be StepSuccess, got %v", results[2].Status)
+	}
+}
+
+func TestEngineContinueOnErrorStopsOnContextCancel(t *testing.T) {
+	eng := NewEngine(1, WithContinueOnError(true), WithRollbackOnError(false))
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var secondRan atomic.Bool
+	tasks := []Task{
+		{
+			Step: domain.PlanStep{ID: 1, ResourceID: "cancels-ctx"},
+			Execute: func(ctx context.Context) error {
+				cancel()
+				return ctx.Err()
+			},
+		},
+		{
+			Step: domain.PlanStep{ID: 2, ResourceID: "should-not-start"},
+			Execute: func(ctx context.Context) error {
+				secondRan.Store(true)
+				return nil
+			},
+		},
+	}
+
+	results, err := eng.ExecuteTasks(ctx, tasks, nil)
+	if !errors.Is(err, ErrExecutionInterrupted) {
+		t.Fatalf("expected ErrExecutionInterrupted, got %v", err)
+	}
+	if secondRan.Load() {
+		t.Fatal("task 2 should not have been dispatched after context cancellation")
+	}
+	if results[1].Status != domain.StepSkipped {
+		t.Fatalf("expected task 2 status StepSkipped, got %v", results[1].Status)
+	}
+}
+
+func TestEngineNoGoroutineLeaks(t *testing.T) {
+	// Let any background runtime goroutines settle before taking baseline.
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+
+	eng := NewEngine(4, WithRollbackOnError(true))
+
+	// 1. Successful batch with dependencies and locks
+	okTasks := make([]Task, 24)
+	for i := range okTasks {
+		var deps []int
+		if i > 0 && i%4 != 0 {
+			deps = []int{i}
+		}
+		okTasks[i] = Task{
+			Step:    domain.PlanStep{ID: i + 1, ResourceID: "ok-task", DependsOn: deps},
+			Locks:   []string{"lock-a"},
+			Execute: func(ctx context.Context) error { return nil },
+		}
+	}
+	if _, err := eng.ExecuteTasks(context.Background(), okTasks, nil); err != nil {
+		t.Fatalf("ok batch failed: %v", err)
+	}
+
+	// 2. Panicking task + cancellation
+	panicTasks := []Task{
+		{
+			Step: domain.PlanStep{ID: 1, ResourceID: "panicker"},
+			Execute: func(ctx context.Context) error {
+				panic("simulated panic")
+			},
+		},
+		{
+			Step: domain.PlanStep{ID: 2, ResourceID: "waiter"},
+			Execute: func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		},
+	}
+	if _, err := eng.ExecuteTasks(context.Background(), panicTasks, nil); err == nil {
+		t.Fatal("expected error from panicking task")
+	}
+
+	// Give Go scheduler a moment to reap exited worker goroutines.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		if runtime.NumGoroutine() <= baseline+1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	after := runtime.NumGoroutine()
+	t.Fatalf("potential goroutine leak: baseline=%d, after=%d", baseline, after)
+}
+
+func BenchmarkExecuteTasks(b *testing.B) {
+	eng := NewEngine(8, WithRollbackOnError(false))
+	tasks := make([]Task, 64)
+	for i := range tasks {
+		var deps []int
+		if i >= 8 {
+			deps = []int{i - 7}
+		}
+		tasks[i] = Task{
+			Step:    domain.PlanStep{ID: i + 1, ResourceID: "bench-task", DependsOn: deps},
+			Execute: func(ctx context.Context) error { return nil },
+		}
+	}
+
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := eng.ExecuteTasks(ctx, tasks, nil); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

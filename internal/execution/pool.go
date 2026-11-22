@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/arturonavax/anx/internal/domain"
@@ -92,7 +93,7 @@ type completion struct {
 }
 
 // run owns all mutable scheduling state. It is only touched by the coordinator goroutine
-// (the caller of ExecuteTasks), so no mutex is needed; workers communicate solely via the done channel.
+// (the caller of ExecuteTasks), so no mutex is needed; workers communicate solely via work/done channels.
 type run struct {
 	tasks   []Task
 	g       *graph
@@ -100,6 +101,7 @@ type run struct {
 	ready   []int // task indices ready to start, ascending (deterministic order)
 	held    map[string]struct{}
 	results []Result
+	work    chan int
 	done    chan completion
 	running int
 }
@@ -123,29 +125,40 @@ func (e *Engine) ExecuteTasks(
 		return nil, err
 	}
 
-	notify := func(r Result) {
-		if onProgress != nil {
-			onProgress(r)
-		}
-	}
-
-	r := newRun(tasks, g)
+	workerCount := min(len(tasks), e.maxWorkers)
+	r := newRun(tasks, g, workerCount)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var execErr error
-	var stepErrors []error
+	// Fixed worker pool bounded to min(len(tasks), maxWorkers) avoids per-task goroutine churn
+	// and guarantees every worker exits cleanly before ExecuteTasks returns.
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer wg.Done()
+			for idx := range r.work {
+				r.done <- completion{idx: idx, res: e.runSingleTask(runCtx, &r.tasks[idx])}
+			}
+		}()
+	}
+
+	var (
+		interruptErr error
+		failed       bool
+		stepErrors   []error
+	)
 	completed := make([]int, 0, len(tasks))
 
 	for {
-		if execErr == nil {
+		if interruptErr == nil {
 			if cerr := ctx.Err(); cerr != nil {
-				execErr = fmt.Errorf("%w: %w", ErrExecutionInterrupted, cerr)
+				interruptErr = fmt.Errorf("%w: %w", ErrExecutionInterrupted, cerr)
 				cancel()
 			}
 		}
-		if execErr == nil || e.continueOnError {
-			r.dispatch(runCtx, e, notify)
+		if interruptErr == nil && (!failed || e.continueOnError) {
+			r.dispatch(e, onProgress)
 		}
 		if r.running == 0 {
 			break
@@ -157,15 +170,17 @@ func (e *Engine) ExecuteTasks(
 		r.running--
 		r.release(c.idx)
 		r.results[c.idx] = c.res
-		notify(c.res)
+		if onProgress != nil {
+			onProgress(c.res)
+		}
 
 		if c.res.Error != nil {
 			step := &tasks[c.idx].Step
 			stepErr := fmt.Errorf("step %d (%s) failed: %w", step.ID, step.ResourceID, c.res.Error)
 			stepErrors = append(stepErrors, stepErr)
 			if !e.continueOnError {
-				if execErr == nil {
-					execErr = stepErr
+				if !failed {
+					failed = true
 					cancel()
 				}
 			}
@@ -173,20 +188,30 @@ func (e *Engine) ExecuteTasks(
 		}
 
 		completed = append(completed, c.idx)
-		if execErr == nil || e.continueOnError {
+		if interruptErr == nil && (!failed || e.continueOnError) {
 			r.unblock(c.idx)
 		}
 	}
+
+	// Coordinator owns r.work: closing it signals all workers to exit and wg.Wait() proves zero leaks.
+	close(r.work)
+	wg.Wait()
 
 	if e.continueOnError {
 		for i := range r.results {
 			if r.results[i].Status == domain.StepPending {
 				r.results[i].Status = domain.StepSkipped
-				notify(r.results[i])
+				if onProgress != nil {
+					onProgress(r.results[i])
+				}
 			}
 		}
 	}
 
+	var execErr error
+	if interruptErr != nil {
+		execErr = interruptErr
+	}
 	if len(stepErrors) > 0 {
 		if execErr == nil {
 			execErr = errors.Join(stepErrors...)
@@ -196,21 +221,34 @@ func (e *Engine) ExecuteTasks(
 	}
 
 	if execErr != nil && e.rollbackOnError && !e.continueOnError && len(completed) > 0 {
-		execErr = errors.Join(execErr, e.compensate(g, tasks, completed, r.results, notify))
+		execErr = errors.Join(execErr, e.compensate(g, tasks, completed, r.results, onProgress))
 	}
 
 	return r.results, execErr
 }
 
-func newRun(tasks []Task, g *graph) *run {
+func newRun(tasks []Task, g *graph, workerCount int) *run {
+	hasLocks := false
+	for _, locks := range g.locks {
+		if len(locks) > 0 {
+			hasLocks = true
+			break
+		}
+	}
+	var held map[string]struct{}
+	if hasLocks {
+		held = make(map[string]struct{}, workerCount)
+	}
+
 	r := &run{
 		tasks:   tasks,
 		g:       g,
 		indeg:   slices.Clone(g.indeg),
 		ready:   make([]int, 0, len(tasks)),
-		held:    make(map[string]struct{}),
+		held:    held,
 		results: make([]Result, len(tasks)),
-		done:    make(chan completion, len(tasks)), // buffered: a worker never blocks on reporting
+		work:    make(chan int, workerCount),
+		done:    make(chan completion, workerCount), // buffered to workerCount: workers never block on reporting
 	}
 	for i := range tasks {
 		r.results[i] = Result{StepID: tasks[i].Step.ID, Status: domain.StepPending}
@@ -223,7 +261,7 @@ func newRun(tasks []Task, g *graph) *run {
 
 // dispatch starts ready tasks while worker slots and their locks are available. Tasks whose locks
 // are busy are skipped (not blocked on), so one contended resource never starves unrelated work.
-func (r *run) dispatch(ctx context.Context, e *Engine, notify func(Result)) {
+func (r *run) dispatch(e *Engine, notify func(Result)) {
 	for r.running < e.maxWorkers {
 		pos := r.firstRunnable()
 		if pos < 0 {
@@ -241,9 +279,7 @@ func (r *run) dispatch(ctx context.Context, e *Engine, notify func(Result)) {
 			notify(r.results[idx])
 		}
 
-		go func() {
-			r.done <- completion{idx: idx, res: e.runSingleTask(ctx, &r.tasks[idx])}
-		}()
+		r.work <- idx
 	}
 }
 
@@ -309,7 +345,9 @@ func (e *Engine) compensate(
 		}
 
 		results[idx].Status = domain.StepCompensated
-		notify(results[idx])
+		if notify != nil {
+			notify(results[idx])
+		}
 	}
 	return errors.Join(errs...)
 }
