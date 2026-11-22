@@ -13,6 +13,77 @@ import (
 	"github.com/arturonavax/anx/internal/cli"
 )
 
+func useCLIConfigFixture(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "localappdata"))
+	t.Setenv("APPDATA", filepath.Join(home, "appdata"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+
+	repo := t.TempDir()
+	t.Setenv("ANX_CONFIG_REPO", repo)
+	for _, dir := range []string{"manifests/hacks", "files"} {
+		if err := os.MkdirAll(filepath.Join(repo, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string]string{
+		"manifests/fixture.yaml": `
+packages:
+  - id: ripgrep
+    name: Ripgrep
+    strategies:
+      - type: native
+        packages: {apt: [ripgrep], brew: [ripgrep], winget: [BurntSushi.ripgrep.MSVC]}
+  - id: neovim
+    name: Neovim
+    strategies:
+      - type: native
+        packages: {apt: [neovim], brew: [neovim], winget: [Neovim.Neovim]}
+  - id: zsh
+    name: Zsh
+    strategies:
+      - type: native
+        packages: {apt: [zsh], brew: [zsh]}
+  - id: golang
+    name: Go
+    strategies:
+      - type: native
+        packages: {apt: [golang], brew: [go], winget: [GoLang.Go]}
+profiles:
+  - name: developer
+    packages: [ripgrep]
+    configurations: [test-config]
+configurations:
+  - id: test-config
+    group: core
+    source: files/test.conf
+    target: ~/.anx-test.conf
+`,
+		"manifests/hacks/fixture.yaml": `
+hacks:
+  - id: test-hardware-hack
+    name: Test hardware hack
+    category: hardware
+    safe_by_opt_in: true
+    steps:
+      - id: noop
+        name: No operation
+        command: ["true"]
+`,
+		"files/test.conf": "enabled=true\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write fixture %s: %v", name, err)
+		}
+	}
+}
+
 func TestCLIVersion(t *testing.T) {
 	var outBuf, errBuf bytes.Buffer
 	code := cli.ExecuteCLI([]string{"version"}, &outBuf, &errBuf, "1.0.0-test", "abcdef", "2026-10-29")
@@ -63,6 +134,7 @@ func TestCLIDoctor(t *testing.T) {
 }
 
 func TestCLIDoctor_Fix(t *testing.T) {
+	useCLIConfigFixture(t)
 	var outBuf, errBuf bytes.Buffer
 	code := cli.ExecuteCLI([]string{"doctor", "--fix", "--dry-run"}, &outBuf, &errBuf, "1.0.0-test", "", "")
 	if code != 0 {
@@ -96,6 +168,7 @@ func TestCLIRepo(t *testing.T) {
 }
 
 func TestCLIDestroyer_ResetDryRun(t *testing.T) {
+	useCLIConfigFixture(t)
 	var outBuf, errBuf bytes.Buffer
 	code := cli.ExecuteCLI([]string{"reset", "--dry-run", "--yes"}, &outBuf, &errBuf, "1.0.0-test", "", "")
 	if code != 0 {
@@ -107,6 +180,7 @@ func TestCLIDestroyer_ResetDryRun(t *testing.T) {
 }
 
 func TestCLIDestroyer_UninstallDryRun(t *testing.T) {
+	useCLIConfigFixture(t)
 	var outBuf, errBuf bytes.Buffer
 	code := cli.ExecuteCLI([]string{"reset", "--uninstall-only", "--dry-run", "--yes"}, &outBuf, &errBuf, "1.0.0-test", "", "")
 	if code != 0 {
@@ -118,6 +192,7 @@ func TestCLIDestroyer_UninstallDryRun(t *testing.T) {
 }
 
 func TestCLIDestroyer_ApplyFlagDryRun(t *testing.T) {
+	useCLIConfigFixture(t)
 	var outBuf, errBuf bytes.Buffer
 	code := cli.ExecuteCLI([]string{"apply", "--destroyer", "--dry-run", "--yes"}, &outBuf, &errBuf, "1.0.0-test", "", "")
 	if code != 0 {
@@ -129,6 +204,7 @@ func TestCLIDestroyer_ApplyFlagDryRun(t *testing.T) {
 }
 
 func TestCLISyncDiff(t *testing.T) {
+	useCLIConfigFixture(t)
 	var outBuf, errBuf bytes.Buffer
 	code := cli.ExecuteCLI([]string{"diff"}, &outBuf, &errBuf, "1.0.0-test", "", "")
 	if code != 0 {
@@ -137,12 +213,13 @@ func TestCLISyncDiff(t *testing.T) {
 }
 
 func TestCLIHacksList(t *testing.T) {
+	useCLIConfigFixture(t)
 	var outBuf, errBuf bytes.Buffer
 	code := cli.ExecuteCLI([]string{"hacks", "list"}, &outBuf, &errBuf, "1.0.0-test", "", "")
 	if code != 0 {
 		t.Fatalf("expected exit code 0, got %d (err: %s)", code, errBuf.String())
 	}
-	if !strings.Contains(outBuf.String(), "dell-precision-m6800") && !strings.Contains(outBuf.String(), "Registered Hacks") {
+	if !strings.Contains(outBuf.String(), "test-hardware-hack") {
 		t.Fatalf("expected hacks output, got: %s", outBuf.String())
 	}
 }
@@ -365,6 +442,7 @@ func TestCLIUpdate(t *testing.T) {
 }
 
 func TestCLIUpgradeDryRun(t *testing.T) {
+	useCLIConfigFixture(t)
 	var outBuf, errBuf bytes.Buffer
 	code := cli.ExecuteCLI([]string{"upgrade", "--dry-run", "--skip-pull"}, &outBuf, &errBuf, "1.0.0-test", "", "")
 	if code != 0 {
@@ -445,6 +523,7 @@ func TestCLIIdempotence(t *testing.T) {
 }
 
 func TestCLIExplain(t *testing.T) {
+	useCLIConfigFixture(t)
 	// Text format
 	var outBuf, errBuf bytes.Buffer
 	code := cli.ExecuteCLI([]string{"explain", "ripgrep"}, &outBuf, &errBuf, "1.0.0-test", "", "")

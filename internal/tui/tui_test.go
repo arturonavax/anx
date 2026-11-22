@@ -631,9 +631,16 @@ func TestWizardProfilePersistence(t *testing.T) {
 }
 
 func TestConfigsIntegrationStatus(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	if err := os.MkdirAll(filepath.Join(home, ".config", "nvim"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	deps := newTestDeps(t)
 	m := NewModel(deps)
-	m.SetDimensions(120, 40)
+	// Both panes need enough space to display the literal badge labels.
+	m.SetDimensions(192, 40)
 
 	// Jump to TabConfigs (tab 3)
 	nm, _ := m.Update(tea.KeyPressMsg{Text: "3"})
@@ -642,10 +649,11 @@ func TestConfigsIntegrationStatus(t *testing.T) {
 		t.Fatalf("expected TabConfigs, got %v", m.ActiveTab())
 	}
 
-	view := m.View()
-	content := view.Content
-	if !strings.Contains(content, "[Integrated ✓]") && !strings.Contains(content, "[Not Integrated ✗]") {
-		t.Fatalf("expected configs tab to display integration badges, got:\n%s", content)
+	content := ansi.Strip(m.View().Content)
+	for _, badge := range []string{"[Integrated ✓]", "[Not Integrated ✗]"} {
+		if !strings.Contains(content, badge) {
+			t.Errorf("expected configs tab to display %q, got:\n%s", badge, content)
+		}
 	}
 }
 

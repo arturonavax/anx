@@ -2,8 +2,15 @@
 # Run with bash in an isolated environment. No fixture needs network access.
 set -euo pipefail
 
-bootstrap="${1:-$(dirname -- "${BASH_SOURCE[0]}")/../scripts/bootstrap_anx.sh}"
-posix="${2:-$(dirname -- "${BASH_SOURCE[0]}")/../install.sh}"
+absolute_script_path() {
+	local script="$1"
+	local dir
+	dir="$(cd -- "$(dirname -- "$script")" && pwd)" || return 1
+	printf '%s/%s\n' "$dir" "${script##*/}"
+}
+
+bootstrap="$(absolute_script_path "${1:-$(dirname -- "${BASH_SOURCE[0]}")/../scripts/bootstrap_anx.sh}")"
+posix="$(absolute_script_path "${2:-$(dirname -- "${BASH_SOURCE[0]}")/../install.sh}")"
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work"/{tools,payload}

@@ -46,6 +46,7 @@ jobs:
         if: runner.os != 'Windows'
         run: go test -v -race -timeout 10m ./...
 
+      # Includes the offline Windows bootstrap fixture from internal/bootstrap.
       - name: Run unit & integration tests (Windows)
         if: runner.os == 'Windows'
         run: go test -v -timeout 10m ./...
@@ -57,10 +58,6 @@ jobs:
       - name: Build ANX binary (Windows)
         if: runner.os == 'Windows'
         run: go build -v -ldflags "-X main.Version=ci -X main.Commit=${{ github.sha }} -X main.Date=ci" -o bin\anx.exe .\cmd\anx
-
-      - name: Test Windows bootstrap script (plan/dry-run)
-        if: runner.os == 'Windows'
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap_anx.ps1 plan
 
   lint:
     name: Shell & Code Linting
