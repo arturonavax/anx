@@ -90,6 +90,7 @@ done
 # Detect whether source build, release download, or plan preview is explicitly requested
 FORCE_SOURCE=0
 FORCE_GO_INSTALL=0
+INSTALL_ONLY="${ANX_BOOTSTRAP_ONLY:-0}"
 _next_arg=""
 for arg in "$@"; do
 	if [ -n "$_next_arg" ]; then
@@ -139,6 +140,11 @@ for arg in "$@"; do
 		;;
 	--go-install)
 		FORCE_GO_INSTALL=1
+		;;
+	--install-only | --cli-only)
+		INSTALL_ONLY=1
+		ANX_BOOTSTRAP_ONLY=1
+		export ANX_BOOTSTRAP_ONLY
 		;;
 	esac
 done
@@ -281,8 +287,6 @@ if [ "$INTERACTIVE_TTY" -eq 1 ]; then
 		case "$choice" in
 		2)
 			FORCE_SOURCE=1
-			ANX_ONE_SHOT=1
-			set -- "wizard"
 			;;
 		3)
 			echo "  [INFO] Preview mode selected."
@@ -298,8 +302,6 @@ if [ "$INTERACTIVE_TTY" -eq 1 ]; then
 		*)
 			# Default 1: verified release
 			FORCE_SOURCE=0
-			ANX_ONE_SHOT=1
-			set -- "wizard"
 			;;
 		esac
 	else
@@ -328,11 +330,33 @@ if [ "$INTERACTIVE_TTY" -eq 1 ]; then
 		*)
 			# Default 1: build from source
 			FORCE_SOURCE=1
-			ANX_ONE_SHOT=1
-			set -- "wizard"
 			;;
 		esac
 	fi
+
+	prompt_out "  ${TN_DIM}After installing 'anx', what would you like to do?${TN_RESET}\n"
+	prompt_out "    ${TN_ACCENT}${TN_BOLD}1)${TN_RESET} Launch setup wizard  ${TN_GREEN}(Configure environment interactively)${TN_RESET}\n"
+	prompt_out "    ${TN_ACCENT}${TN_BOLD}2)${TN_RESET} Install 'anx' only   ${TN_DIM}(Exit after installing the command)${TN_RESET}\n\n"
+	prompt_out "  Select [1-2] (${TN_DIM}default: 1${TN_RESET}): "
+	if [ -n "$TTY_DEV" ]; then
+		read -r post_choice <"$TTY_DEV" || post_choice="1"
+	else
+		read -r post_choice || post_choice="1"
+	fi
+	prompt_out "\n"
+	case "$post_choice" in
+	2 | n | N | no | NO | exit | only)
+		INSTALL_ONLY=1
+		ANX_BOOTSTRAP_ONLY=1
+		export ANX_BOOTSTRAP_ONLY
+		ANX_ONE_SHOT=0
+		;;
+	*)
+		INSTALL_ONLY=0
+		ANX_ONE_SHOT=1
+		set -- "wizard"
+		;;
+	esac
 fi
 
 export ANX_ONE_SHOT
@@ -541,15 +565,27 @@ if [ -z "${REPO_ROOT}" ]; then
 	if [ "$(uname -s)" != "Darwin" ] && [ "${ANX_ONE_SHOT:-0}" -eq 0 ]; then
 		if [ "$FORCE_GO_INSTALL" -eq 1 ]; then
 			if try_go_install_direct; then
+				if [ "${INSTALL_ONLY:-0}" -eq 1 ]; then
+					echo "  [OK] ANX installed at ${DEST_BIN}/anx. Run 'anx' or 'anx wizard' anytime."
+					exit 0
+				fi
 				dispatch_exec "${DEST_BIN}/anx" "$@"
 			fi
 		fi
 
 		if [ "$FORCE_SOURCE" -eq 0 ]; then
 			if try_download_release_direct; then
+				if [ "${INSTALL_ONLY:-0}" -eq 1 ]; then
+					echo "  [OK] ANX installed at ${DEST_BIN}/anx. Run 'anx' or 'anx wizard' anytime."
+					exit 0
+				fi
 				dispatch_exec "${DEST_BIN}/anx" "$@"
 			fi
 			if try_go_install_direct; then
+				if [ "${INSTALL_ONLY:-0}" -eq 1 ]; then
+					echo "  [OK] ANX installed at ${DEST_BIN}/anx. Run 'anx' or 'anx wizard' anytime."
+					exit 0
+				fi
 				dispatch_exec "${DEST_BIN}/anx" "$@"
 			fi
 		fi
@@ -574,6 +610,7 @@ Modes & Commands:
   --check, check                Run platform diagnosis and health checks (doctor).
   --from-source                 Force compilation from local source repository.
   --go-install                  Install ANX using standard 'go install'.
+  --install-only, --cli-only    Install the 'anx' binary and exit without launching the wizard.
   --uninstall-plan              Preview uninstallation teardown plan.
 
 Profiles & Targets:
@@ -633,6 +670,12 @@ while [ "$count" -gt 0 ]; do
 	-h | --help | help)
 		usage
 		exit 0
+		;;
+	--go-install)
+		set -- "$@" "$arg"
+		;;
+	--install-only | --cli-only)
+		# Handled via ANX_BOOTSTRAP_ONLY=1; do not forward to anx binary
 		;;
 	*)
 		set -- "$@" "$arg"
