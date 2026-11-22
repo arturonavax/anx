@@ -170,10 +170,7 @@ func (s *SyncService) selectConfigs(group string, overrideShell, overrideTermina
 				continue
 			}
 		}
-		if !c.SupportsOS(s.platform.OS()) {
-			continue
-		}
-		if !c.SupportsDesktop(s.platform.DesktopEnv()) {
+		if !ConfigurationMatchesHost(c, s.platform) {
 			continue
 		}
 		if !c.SupportsShell(sh) {
@@ -185,6 +182,14 @@ func (s *SyncService) selectConfigs(group string, overrideShell, overrideTermina
 		out = append(out, c)
 	}
 	return out
+}
+
+// ConfigurationMatchesHost evaluates the OS, distro, desktop and display selectors shared by plans and sync.
+func ConfigurationMatchesHost(cfg domain.ConfigurationResource, plat *platform.Info) bool {
+	return cfg.SupportsOS(plat.OS()) &&
+		cfg.SupportsDesktop(plat.DesktopEnv()) &&
+		cfg.SupportsDistro(plat.Distribution()) &&
+		cfg.SupportsDisplayServer(plat.DisplayServer())
 }
 
 func (s *SyncService) paths(cfg domain.ConfigurationResource) (source, target string, err error) {

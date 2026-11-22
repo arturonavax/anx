@@ -325,7 +325,7 @@ func renderSyncScript(w io.Writer, appCtx *AppContext, args []string, push bool)
 	b.AddSection(actionTitle, "Synchronize managed configuration assets")
 
 	for _, c := range cfgs {
-		if !c.SupportsOS(appCtx.Platform.OS()) {
+		if !app.ConfigurationMatchesHost(c, appCtx.Platform) {
 			continue
 		}
 		target := appCtx.Platform.ExpandPath(c.TargetForOS(appCtx.Platform.OS()))

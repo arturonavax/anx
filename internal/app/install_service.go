@@ -56,8 +56,8 @@ func NewInstallService(deps InstallDeps) *InstallService {
 	if workers < 4 {
 		workers = 4
 	}
-	if workers > 32 {
-		workers = 32
+	if workers > domain.MaxProfileParallelism {
+		workers = domain.MaxProfileParallelism
 	}
 	return &InstallService{
 		platform:   deps.Platform,
@@ -67,9 +67,22 @@ func NewInstallService(deps InstallDeps) *InstallService {
 		provider:   deps.Provider,
 		store:      deps.Store,
 		sync:       deps.Sync,
-		engine:     execution.NewEngine(workers, execution.WithContinueOnError(true), execution.WithRollbackOnError(false)),
+		engine:     newInstallEngine(workers),
 		onProgress: deps.OnProgress,
 	}
+}
+
+func newInstallEngine(workers int) *execution.Engine {
+	return execution.NewEngine(workers, execution.WithContinueOnError(true), execution.WithRollbackOnError(false))
+}
+
+func (s *InstallService) engineForProfile(profile string) *execution.Engine {
+	if s.catalog != nil {
+		if selected, ok := s.catalog.GetProfile(profile); ok && selected.MaxParallel > 0 {
+			return newInstallEngine(selected.MaxParallel)
+		}
+	}
+	return s.engine
 }
 
 // SetOnProgress sets or updates the progress event listener.
@@ -349,7 +362,7 @@ func (s *InstallService) PlanWithReinstall(ctx context.Context, profileName stri
 		}
 		var dotfileCfgs, osAssetCfgs, osScriptCfgs []domain.ConfigurationResource
 		for _, cfg := range cfgs {
-			if !cfg.SupportsOS(s.platform.OS()) {
+			if !ConfigurationMatchesHost(cfg, s.platform) {
 				continue
 			}
 			if cfg.Group != "osconfig" {
@@ -504,6 +517,7 @@ func (s *InstallService) Apply(ctx context.Context, plan *domain.ExecutionPlan) 
 		}
 	}
 
+	engine := s.engineForProfile(plan.Profile)
 	var execErrs []error
 	for _, phaseTasks := range [][]execution.Task{installTasks, dotfileTasks, osAssetTasks, osScriptTasks} {
 		if len(phaseTasks) == 0 {
@@ -513,7 +527,7 @@ func (s *InstallService) Apply(ctx context.Context, plan *domain.ExecutionPlan) 
 			execErrs = append(execErrs, execution.ErrExecutionInterrupted)
 			break
 		}
-		if _, err := s.engine.ExecuteTasks(ctx, phaseTasks, onResult); err != nil {
+		if _, err := engine.ExecuteTasks(ctx, phaseTasks, onResult); err != nil {
 			execErrs = append(execErrs, err)
 			if errors.Is(err, execution.ErrExecutionInterrupted) {
 				break

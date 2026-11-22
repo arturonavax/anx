@@ -98,6 +98,22 @@ retain Go's module metadata. Use complete history to plan a release. Before
 publishing a new major version, verify Go module path and installation
 compatibility. Planning a version never performs a release action.
 
+## Environment manifests
+
+Use ordered package strategies for platform-specific installation methods.
+Declare package and strategy dependencies with `depends_on`; the scheduler
+honors dependency order and serializes access to shared package managers.
+Local scripts, OS configuration, and fonts belong in the environment repo.
+
+A profile can cap its workers with `max_parallel: 1` through `32`; omit it or
+use `0` for ANX's CPU-based default. The limit belongs to the selected
+profile and does not inherit through `extends`.
+
+Configuration entries can combine `os`, `distros`, `desktops` and
+`display_servers`. ANX applies these rules to both plans and synchronization.
+For example, `distros: [debian, ubuntu]` matches those distribution IDs and
+`display_servers: [wayland]` requires Wayland. Omitted filters are unrestricted.
+
 ## Key Commands
 
 ```sh

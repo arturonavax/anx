@@ -231,6 +231,8 @@ type ConfigurationResource struct {
 	Excludes           []string              `json:"excludes,omitempty" yaml:"excludes,omitempty"`
 	SupportedOS        []string              `json:"supported_os,omitempty" yaml:"os,omitempty"`
 	SupportedDesktops  []string              `json:"supported_desktops,omitempty" yaml:"desktops,omitempty"`
+	SupportedDistros   []string              `json:"supported_distros,omitempty" yaml:"distros,omitempty"`
+	DisplayServers     []string              `json:"display_servers,omitempty" yaml:"display_servers,omitempty"`
 	SupportedShells    []string              `json:"supported_shells,omitempty" yaml:"shells,omitempty"`
 	SupportedTerminals []string              `json:"supported_terminals,omitempty" yaml:"terminals,omitempty"`
 	PostSyncCmds       [][]string            `json:"post_sync_cmds,omitempty" yaml:"post_sync_cmds,omitempty"`
@@ -325,6 +327,28 @@ func (c ConfigurationResource) SupportsDesktop(de string) bool {
 	return false
 }
 
+// SupportsDistro reports whether the configuration applies to the Linux distribution ID.
+func (c ConfigurationResource) SupportsDistro(distro string) bool {
+	return supportsConfigSelector(c.SupportedDistros, distro)
+}
+
+// SupportsDisplayServer reports whether the configuration applies to the active display server.
+func (c ConfigurationResource) SupportsDisplayServer(server string) bool {
+	return supportsConfigSelector(c.DisplayServers, server)
+}
+
+func supportsConfigSelector(allowed []string, detected string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, value := range allowed {
+		if strings.EqualFold(value, "all") || (detected != "" && strings.EqualFold(value, detected)) {
+			return true
+		}
+	}
+	return false
+}
+
 // SupportsShell reports whether the configuration applies to the specified shell.
 func (c ConfigurationResource) SupportsShell(sh string) bool {
 	if len(c.SupportedShells) == 0 {
@@ -366,4 +390,8 @@ type Profile struct {
 	ConfigGroups   []string `json:"config_groups,omitempty" yaml:"config_groups,omitempty"`
 	Configurations []string `json:"configurations" yaml:"configurations"`
 	Hacks          []string `json:"hacks,omitempty" yaml:"hacks,omitempty"`
+	MaxParallel    int      `json:"max_parallel,omitempty" yaml:"max_parallel,omitempty"`
 }
+
+// MaxProfileParallelism bounds the number of scheduler workers a profile can request.
+const MaxProfileParallelism = 32

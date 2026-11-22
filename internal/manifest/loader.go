@@ -218,6 +218,12 @@ func (c *Catalog) mergeYAML(source string, data []byte) error {
 		if strings.TrimSpace(prof.Name) == "" {
 			return fmt.Errorf("profile in %q is missing name", source)
 		}
+		if prof.MaxParallel < 0 || prof.MaxParallel > domain.MaxProfileParallelism {
+			return fmt.Errorf(
+				"profile %q in %q: max_parallel must be between 0 and %d",
+				prof.Name, source, domain.MaxProfileParallelism,
+			)
+		}
 		if prof.Packages == nil {
 			prof.Packages = []string{}
 		}
