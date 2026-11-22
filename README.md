@@ -11,21 +11,30 @@
 ## Installation
 
 ### Linux / macOS
+
 ```sh
 curl -fsSL https://sh.arturonavax.dev/install.sh | sh
+```
+
+```sh
 # Or with a custom configuration repository:
 curl -fsSL https://sh.arturonavax.dev/install.sh \
   | sh -s -- --config-repo git@github.com:someone/env.git --profile developer
 ```
 
 ### Windows (PowerShell)
+
 ```powershell
 irm https://sh.arturonavax.dev/install.ps1 | iex
+```
+
+```powershell
 # Or with a custom configuration repository:
 & ([scriptblock]::Create((irm https://sh.arturonavax.dev/install.ps1))) -ConfigRepo "https://github.com/someone/env.git"
 ```
 
 ### From Source
+
 ```sh
 go install github.com/arturonavax/anx/cmd/anx@latest
 ```
