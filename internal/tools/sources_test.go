@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/arturonavax/anx/internal/gittransport"
 )
 
 func TestMultiSourceDiscoveryCollisionAndAtomicUpdate(t *testing.T) {
@@ -129,6 +131,124 @@ func TestInvalidSourceManifestRejected(t *testing.T) {
 	mgr := NewSourceManager(filepath.Join(tmp, "cfg"), filepath.Join(tmp, "data"), filepath.Join(tmp, "bin"), "")
 	if _, _, err := mgr.AddSource(context.Background(), ToolSource{ID: "bad", Path: badRepo}); err == nil {
 		t.Fatalf("expected invalid schema_version to be rejected")
+	}
+}
+
+type fakeGitRunner struct {
+	fn func(ctx context.Context, env []string, dir string, name string, args ...string) (string, string, error)
+}
+
+func (f fakeGitRunner) Run(ctx context.Context, env []string, dir string, name string, args ...string) (string, string, error) {
+	return f.fn(ctx, env, dir, name, args...)
+}
+
+func TestSourceManagerSSHKeyAndOptionalPersistence(t *testing.T) {
+	tmp := t.TempDir()
+	keyPath := filepath.Join(tmp, "id_vault")
+	if err := os.WriteFile(keyPath, []byte("fake-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var seenSSHCmds []string
+	mgr := NewSourceManager(
+		filepath.Join(tmp, "cfg"),
+		filepath.Join(tmp, "data"),
+		filepath.Join(tmp, "bin"),
+		"",
+	)
+	mgr.Git = &gittransport.Adapter{
+		Runner: fakeGitRunner{fn: func(_ context.Context, env []string, _ string, _ string, args ...string) (string, string, error) {
+			for _, kv := range env {
+				if strings.HasPrefix(kv, "GIT_SSH_COMMAND=") {
+					seenSSHCmds = append(seenSSHCmds, kv)
+				}
+			}
+			if len(args) > 0 && args[0] == "ls-remote" {
+				return "deadbeef\tHEAD\n", "", nil
+			}
+			if len(args) > 0 && args[0] == "clone" {
+				dest := args[len(args)-1]
+				mustWriteFile(t, filepath.Join(dest, "tool.yaml"), `
+schema_version: 1
+id: vault-helper
+name: "Vault Helper"
+executable: vault-helper
+entrypoint: bin/helper.sh
+language: bash
+`)
+				mustWriteFile(t, filepath.Join(dest, "bin", "helper.sh"), "#!/bin/sh\necho ok\n")
+				return "", "", nil
+			}
+			return "", "", nil
+		}},
+	}
+
+	saved, discovered, err := mgr.AddSource(context.Background(), ToolSource{
+		ID:       "vault",
+		URL:      "git@github.com:example-org/vault.git",
+		Auth:     "ssh",
+		SSHKey:   keyPath,
+		Optional: true,
+	})
+	if err != nil {
+		t.Fatalf("AddSource with SSHKey failed: %v", err)
+	}
+	if saved.SSHKey != keyPath || !saved.Optional {
+		t.Fatalf("expected SSHKey and Optional preserved, got %+v", saved)
+	}
+	if len(discovered) != 1 || discovered[0].Manifest.ID != "vault-helper" {
+		t.Fatalf("unexpected discovered tools: %+v", discovered)
+	}
+	if len(seenSSHCmds) == 0 {
+		t.Fatalf("expected GIT_SSH_COMMAND to be passed to git runner")
+	}
+	for _, cmd := range seenSSHCmds {
+		if !strings.Contains(cmd, "id_vault") || !strings.Contains(cmd, "IdentitiesOnly=yes") {
+			t.Fatalf("expected SSH key in GIT_SSH_COMMAND, got %q", cmd)
+		}
+	}
+
+	// Reload from disk and verify YAML persistence
+	loaded, err := mgr.LoadSources()
+	if err != nil {
+		t.Fatalf("LoadSources failed: %v", err)
+	}
+	var foundVault *ToolSource
+	for i := range loaded {
+		if loaded[i].ID == "vault" {
+			foundVault = &loaded[i]
+			break
+		}
+	}
+	if foundVault == nil || foundVault.SSHKey != keyPath || !foundVault.Optional {
+		t.Fatalf("reloaded vault source missing SSHKey/Optional: %+v", loaded)
+	}
+
+	// Verify UpdateSource forwards SSHKey
+	seenSSHCmds = nil
+	if _, err := mgr.UpdateSource(context.Background(), "vault"); err != nil {
+		t.Fatalf("UpdateSource failed: %v", err)
+	}
+	if len(seenSSHCmds) == 0 {
+		t.Fatalf("expected GIT_SSH_COMMAND on UpdateSource")
+	}
+	for _, cmd := range seenSSHCmds {
+		if !strings.Contains(cmd, "id_vault") {
+			t.Fatalf("expected SSH key in UpdateSource GIT_SSH_COMMAND, got %q", cmd)
+		}
+	}
+
+	// Remove cached dir and confirm VerifySource probes with SSHKey
+	if err := os.RemoveAll(filepath.Join(mgr.CacheDir, "vault")); err != nil {
+		t.Fatal(err)
+	}
+	seenSSHCmds = nil
+	_, err = mgr.VerifySource(context.Background(), "vault")
+	if err == nil || !strings.Contains(err.Error(), "not cached locally") {
+		t.Fatalf("expected not cached locally after successful probe, got %v", err)
+	}
+	if len(seenSSHCmds) == 0 || !strings.Contains(seenSSHCmds[0], "id_vault") {
+		t.Fatalf("expected VerifySource remote probe to forward SSHKey, got %v", seenSSHCmds)
 	}
 }
 

@@ -6,13 +6,28 @@ import (
 	"github.com/arturonavax/anx/internal/domain"
 )
 
-// CatalogDocument represents any declarative YAML file containing packages, configurations, and/or profiles.
+// CatalogDocument represents any declarative YAML file containing packages, configurations, profiles, and/or tool sources.
 type CatalogDocument struct {
 	Packages       []PackageSpec                  `json:"packages,omitempty" yaml:"packages,omitempty"`
 	Configurations []domain.ConfigurationResource `json:"configurations,omitempty" yaml:"configurations,omitempty"`
 	Profiles       []domain.Profile               `json:"profiles,omitempty" yaml:"profiles,omitempty"`
 	Archives       []ArchiveRecord                `json:"archives,omitempty" yaml:"archives,omitempty"`
 	Hacks          []domain.HackProfile           `json:"hacks,omitempty" yaml:"hacks,omitempty"`
+	ToolSources    []ToolSourceSpec               `json:"tool_sources,omitempty" yaml:"tool_sources,omitempty"`
+}
+
+// ToolSourceSpec declares an external, personal, or private tool repository in a manifest.
+type ToolSourceSpec struct {
+	ID          string `json:"id" yaml:"id"`
+	Name        string `json:"name,omitempty" yaml:"name,omitempty"`
+	URL         string `json:"url" yaml:"url"`
+	Type        string `json:"type,omitempty" yaml:"type,omitempty"`
+	Auth        string `json:"auth,omitempty" yaml:"auth,omitempty"`
+	SSHKey      string `json:"ssh_key,omitempty" yaml:"ssh_key,omitempty"`
+	Branch      string `json:"branch,omitempty" yaml:"branch,omitempty"`
+	Optional    bool   `json:"optional,omitempty" yaml:"optional,omitempty"`
+	VerifySSH   bool   `json:"verify_ssh,omitempty" yaml:"verify_ssh,omitempty"`
+	Description string `json:"description,omitempty" yaml:"description,omitempty"`
 }
 
 // ArchiveRecord represents a retired, decommissioned, or deprecated component tracked historically.

@@ -46,7 +46,7 @@ func WithUserDropInDir(dir string) Option {
 	}
 }
 
-// Catalog holds the merged declarative definitions of packages, configurations, and profiles.
+// Catalog holds the merged declarative definitions of packages, configurations, profiles, and tool sources.
 type Catalog struct {
 	mu             sync.RWMutex
 	packages       map[string]PackageSpec
@@ -54,6 +54,7 @@ type Catalog struct {
 	profiles       map[string]domain.Profile
 	archives       map[string]ArchiveRecord
 	hacks          map[string]domain.HackProfile
+	toolSources    map[string]ToolSourceSpec
 }
 
 // LoadCatalog loads embedded YAML manifests and overlays optional repository and user drop-in YAML files.
@@ -71,6 +72,7 @@ func LoadCatalog(opts ...Option) (*Catalog, error) {
 		profiles:       make(map[string]domain.Profile, 12),
 		archives:       make(map[string]ArchiveRecord, 16),
 		hacks:          make(map[string]domain.HackProfile, 8),
+		toolSources:    make(map[string]ToolSourceSpec, 8),
 	}
 
 	if err := c.loadFromFS(defaults.EmbeddedFS, "."); err != nil {
@@ -254,6 +256,44 @@ func (c *Catalog) mergeYAML(source string, data []byte) error {
 		c.hacks[hk.ID] = hk
 	}
 
+	for _, ts := range doc.ToolSources {
+		if err := validateToolSourceSpec(ts); err != nil {
+			return fmt.Errorf("invalid tool_source in %q: %w", source, err)
+		}
+		c.toolSources[ts.ID] = ts
+	}
+
+	return nil
+}
+
+var (
+	validToolSourceTypes = map[string]bool{
+		"single":     true,
+		"collection": true,
+		"builtin":    true,
+	}
+	validToolSourceAuths = map[string]bool{
+		"auto":  true,
+		"ssh":   true,
+		"https": true,
+	}
+)
+
+func validateToolSourceSpec(ts ToolSourceSpec) error {
+	if strings.TrimSpace(ts.ID) == "" {
+		return errors.New("tool_source id cannot be empty")
+	}
+	t := strings.ToLower(strings.TrimSpace(ts.Type))
+	if t != "" && !validToolSourceTypes[t] {
+		return fmt.Errorf("tool_source %q has unsupported type %q (expected single, collection, or builtin)", ts.ID, ts.Type)
+	}
+	if t != "builtin" && strings.TrimSpace(ts.URL) == "" {
+		return fmt.Errorf("tool_source %q requires url", ts.ID)
+	}
+	a := strings.ToLower(strings.TrimSpace(ts.Auth))
+	if a != "" && !validToolSourceAuths[a] {
+		return fmt.Errorf("tool_source %q has unsupported auth %q (expected auto, ssh, or https)", ts.ID, ts.Auth)
+	}
 	return nil
 }
 
@@ -533,6 +573,32 @@ func (c *Catalog) ListHacks() []domain.HackProfile {
 	result := make([]domain.HackProfile, 0, len(keys))
 	for _, k := range keys {
 		result = append(result, c.hacks[k])
+	}
+	return result
+}
+
+// GetToolSource returns a declarative ToolSourceSpec by ID.
+func (c *Catalog) GetToolSource(id string) (ToolSourceSpec, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ts, ok := c.toolSources[id]
+	return ts, ok
+}
+
+// ListToolSources returns all declarative tool sources sorted deterministically by ID.
+func (c *Catalog) ListToolSources() []ToolSourceSpec {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	keys := make([]string, 0, len(c.toolSources))
+	for k := range c.toolSources {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	result := make([]ToolSourceSpec, 0, len(keys))
+	for _, k := range keys {
+		result = append(result, c.toolSources[k])
 	}
 	return result
 }

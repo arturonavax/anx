@@ -193,3 +193,207 @@ func TestCloneLocalBareRepoEndToEnd(t *testing.T) {
 	}
 	_ = dest
 }
+
+func TestNonInteractiveEnvWithKey(t *testing.T) {
+	t.Run("empty key matches NonInteractiveEnv", func(t *testing.T) {
+		env, err := NonInteractiveEnvWithKey("")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		joined := strings.Join(env, "\n")
+		if !strings.Contains(joined, "GIT_TERMINAL_PROMPT=0") {
+			t.Fatalf("expected GIT_TERMINAL_PROMPT=0")
+		}
+		if !strings.Contains(joined, "BatchMode=yes") {
+			t.Fatalf("expected BatchMode=yes")
+		}
+		if strings.Contains(joined, "StrictHostKeyChecking=no") {
+			t.Fatalf("must NEVER disable StrictHostKeyChecking")
+		}
+	})
+
+	t.Run("missing key returns classified ErrKindAuth", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "does-not-exist-id_ed25519")
+		_, err := NonInteractiveEnvWithKey(missing)
+		var tErr *TransportError
+		if !errors.As(err, &tErr) || tErr.Kind != ErrKindAuth {
+			t.Fatalf("expected TransportError ErrKindAuth, got %v", err)
+		}
+		if tErr.Remediation == "" {
+			t.Fatalf("expected actionable remediation in TransportError")
+		}
+	})
+
+	t.Run("tilde expansion resolves via HOME and builds strict GIT_SSH_COMMAND", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home)
+
+		keyPath := filepath.Join(home, ".ssh", "vault key")
+		if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(keyPath, []byte("fake-key-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		env, err := NonInteractiveEnvWithKey("~/.ssh/vault key")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var sshCmd string
+		var hasPromptZero bool
+		for _, kv := range env {
+			if kv == "GIT_TERMINAL_PROMPT=0" {
+				hasPromptZero = true
+			}
+			if strings.HasPrefix(kv, "GIT_SSH_COMMAND=") {
+				sshCmd = strings.TrimPrefix(kv, "GIT_SSH_COMMAND=")
+			}
+		}
+		if !hasPromptZero {
+			t.Fatalf("expected GIT_TERMINAL_PROMPT=0")
+		}
+		if sshCmd == "" {
+			t.Fatalf("expected GIT_SSH_COMMAND to be set")
+		}
+		if !strings.Contains(sshCmd, "-i ") || !strings.Contains(sshCmd, filepath.ToSlash(keyPath)) && !strings.Contains(sshCmd, keyPath) {
+			t.Fatalf("expected -i with expanded key path %q in GIT_SSH_COMMAND, got %q", keyPath, sshCmd)
+		}
+		for _, want := range []string{"-o IdentitiesOnly=yes", "-o BatchMode=yes", "-o ConnectTimeout=8"} {
+			if !strings.Contains(sshCmd, want) {
+				t.Fatalf("expected %q in GIT_SSH_COMMAND, got %q", want, sshCmd)
+			}
+		}
+		if strings.Contains(sshCmd, "StrictHostKeyChecking=no") {
+			t.Fatalf("must NEVER disable StrictHostKeyChecking: %q", sshCmd)
+		}
+	})
+}
+
+func TestVerifySSHAccess(t *testing.T) {
+	home := t.TempDir()
+	keyPath := filepath.Join(home, "id_vault")
+	if err := os.WriteFile(keyPath, []byte("dummy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("forces SSH transport and passes identity key", func(t *testing.T) {
+		var seenTarget string
+		var seenSSHCmd string
+		a := &Adapter{
+			Runner: fakeRunner{fn: func(_ context.Context, env []string, _ string, _ string, args ...string) (string, string, error) {
+				seenTarget = args[2]
+				for _, kv := range env {
+					if strings.HasPrefix(kv, "GIT_SSH_COMMAND=") {
+						seenSSHCmd = kv
+					}
+				}
+				return "abcdef123456\tHEAD\n", "", nil
+			}},
+		}
+
+		res, err := a.VerifySSHAccess(context.Background(), "https://github.com/example-org/vault.git", keyPath)
+		if err != nil {
+			t.Fatalf("VerifySSHAccess failed: %v", err)
+		}
+		if res.Transport != "ssh" {
+			t.Fatalf("expected ssh transport, got %q", res.Transport)
+		}
+		if res.ResolvedURL != "git@github.com:example-org/vault.git" {
+			t.Fatalf("unexpected resolved URL: %q", res.ResolvedURL)
+		}
+		if res.CommitSHA != "abcdef123456" {
+			t.Fatalf("unexpected commit sha: %q", res.CommitSHA)
+		}
+		if seenTarget != "git@github.com:example-org/vault.git" {
+			t.Fatalf("expected ls-remote against SSH URL, got %q", seenTarget)
+		}
+		if !strings.Contains(seenSSHCmd, "IdentitiesOnly=yes") || !strings.Contains(seenSSHCmd, "id_vault") {
+			t.Fatalf("expected explicit key in GIT_SSH_COMMAND, got %q", seenSSHCmd)
+		}
+	})
+
+	t.Run("auth failure returns classified ErrKindAuth with remediation", func(t *testing.T) {
+		a := &Adapter{
+			Runner: fakeRunner{fn: func(_ context.Context, _ []string, _ string, _ string, _ ...string) (string, string, error) {
+				return "", "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.", errors.New("exit 128")
+			}},
+		}
+
+		_, err := a.VerifySSHAccess(context.Background(), "git@github.com:example-org/vault.git", keyPath)
+		var tErr *TransportError
+		if !errors.As(err, &tErr) || tErr.Kind != ErrKindAuth {
+			t.Fatalf("expected ErrKindAuth, got %v", err)
+		}
+		if tErr.Remediation == "" {
+			t.Fatalf("expected non-empty remediation")
+		}
+	})
+}
+
+func TestCloneAndUpdateForwardSSHKey(t *testing.T) {
+	tmp := t.TempDir()
+	keyPath := filepath.Join(tmp, "id_ed25519")
+	if err := os.WriteFile(keyPath, []byte("dummy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls [][]string
+	var sshCmds []string
+	a := &Adapter{
+		Runner: fakeRunner{fn: func(_ context.Context, env []string, _ string, _ string, args ...string) (string, string, error) {
+			calls = append(calls, args)
+			for _, kv := range env {
+				if strings.HasPrefix(kv, "GIT_SSH_COMMAND=") {
+					sshCmds = append(sshCmds, kv)
+				}
+			}
+			if len(args) > 0 && args[0] == "ls-remote" {
+				return "deadbeef\tHEAD\n", "", nil
+			}
+			return "", "", nil
+		}},
+	}
+
+	dest := filepath.Join(tmp, "vault")
+	res, err := a.Clone(context.Background(), CloneOptions{
+		URL:    "git@github.com:example-org/vault.git",
+		Dest:   dest,
+		Depth:  1,
+		Auth:   AuthSSH,
+		SSHKey: keyPath,
+	})
+	if err != nil {
+		t.Fatalf("Clone failed: %v", err)
+	}
+	if res.Transport != "ssh" {
+		t.Fatalf("expected ssh transport, got %q", res.Transport)
+	}
+	if len(calls) < 2 {
+		t.Fatalf("expected ls-remote and clone calls, got %v", calls)
+	}
+	for i, cmd := range sshCmds {
+		if !strings.Contains(cmd, "id_ed25519") || !strings.Contains(cmd, "IdentitiesOnly=yes") {
+			t.Fatalf("call %d missing explicit SSH key in GIT_SSH_COMMAND: %q", i, cmd)
+		}
+	}
+
+	sshCmds = nil
+	if err := a.UpdateWithOptions(context.Background(), UpdateOptions{
+		Dir:    dest,
+		Ref:    "main",
+		SSHKey: keyPath,
+	}); err != nil {
+		t.Fatalf("UpdateWithOptions failed: %v", err)
+	}
+	if len(sshCmds) == 0 {
+		t.Fatalf("expected GIT_SSH_COMMAND on update calls")
+	}
+	for i, cmd := range sshCmds {
+		if !strings.Contains(cmd, "id_ed25519") {
+			t.Fatalf("update call %d missing SSH key: %q", i, cmd)
+		}
+	}
+}

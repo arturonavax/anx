@@ -281,11 +281,107 @@ func NonInteractiveEnv() []string {
 	return out
 }
 
+// NonInteractiveEnvWithKey builds a safe process environment for unattended Git operations.
+// When sshKey is non-empty, it expands ~/ via os.UserHomeDir, validates that the key file
+// exists, and configures GIT_SSH_COMMAND with -i <key> -o IdentitiesOnly=yes while preserving
+// BatchMode=yes, ConnectTimeout=8, and strict SSH host-key verification.
+func NonInteractiveEnvWithKey(sshKey string) ([]string, error) {
+	trimmedKey := strings.TrimSpace(sshKey)
+	if trimmedKey == "" {
+		return NonInteractiveEnv(), nil
+	}
+
+	expanded, err := expandSSHKeyPath(trimmedKey)
+	if err != nil {
+		return nil, &TransportError{
+			Kind:        ErrKindAuth,
+			Transport:   "ssh",
+			Detail:      fmt.Sprintf("cannot resolve SSH key path %q: %v", trimmedKey, err),
+			Remediation: "Provide an explicit path to an existing SSH private key file",
+			Cause:       err,
+		}
+	}
+
+	info, err := os.Stat(expanded)
+	if err != nil {
+		return nil, &TransportError{
+			Kind:        ErrKindAuth,
+			Transport:   "ssh",
+			Detail:      fmt.Sprintf("SSH identity key not found: %s", expanded),
+			Remediation: "Verify the SSH private key path exists and has readable permissions (chmod 600)",
+			Cause:       err,
+		}
+	}
+	if info.IsDir() {
+		return nil, &TransportError{
+			Kind:        ErrKindAuth,
+			Transport:   "ssh",
+			Detail:      fmt.Sprintf("SSH identity key path is a directory: %s", expanded),
+			Remediation: "Provide the path to an SSH private key file rather than a directory",
+		}
+	}
+
+	base := os.Environ()
+	out := make([]string, 0, len(base)+2)
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "GIT_TERMINAL_PROMPT=") || strings.HasPrefix(kv, "GIT_SSH_COMMAND=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	out = append(out, "GIT_TERMINAL_PROMPT=0")
+	sshCmd := fmt.Sprintf(
+		"ssh -i %s -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=8",
+		shellQuote(filepath.ToSlash(expanded)),
+	)
+	out = append(out, "GIT_SSH_COMMAND="+sshCmd)
+	return out, nil
+}
+
+func expandSSHKeyPath(raw string) (string, error) {
+	key := strings.TrimSpace(raw)
+	if key == "" {
+		return "", nil
+	}
+	if key == "~" || strings.HasPrefix(key, "~/") || strings.HasPrefix(key, "~\\") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if key == "~" {
+			return filepath.Clean(home), nil
+		}
+		return filepath.Clean(filepath.Join(home, key[2:])), nil
+	}
+	return filepath.Clean(key), nil
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// ProbeOptions configures a non-interactive repository probe.
+type ProbeOptions struct {
+	Auth   AuthMode
+	Ref    string
+	SSHKey string
+}
+
 // Probe verifies repository accessibility and selects the working transport.
 func (a *Adapter) Probe(ctx context.Context, rawURL, ref string, mode AuthMode) (ProbeResult, error) {
+	return a.ProbeWithOptions(ctx, rawURL, ProbeOptions{
+		Auth: mode,
+		Ref:  ref,
+	})
+}
+
+// ProbeWithOptions verifies repository accessibility using explicit auth mode, ref, and optional SSH key.
+func (a *Adapter) ProbeWithOptions(ctx context.Context, rawURL string, opts ProbeOptions) (ProbeResult, error) {
+	mode := opts.Auth
 	if mode == "" {
 		mode = AuthAuto
 	}
+	ref := opts.Ref
 	norm := NormalizeURL(rawURL)
 	if norm.Canonical == "" {
 		return ProbeResult{}, &TransportError{
@@ -313,6 +409,17 @@ func (a *Adapter) Probe(ctx context.Context, rawURL, ref string, mode AuthMode) 
 			Transport:   "local",
 			Ref:         ref,
 		}, nil
+	}
+
+	// Validate an explicitly supplied SSH key up front so a bad path is never masked by fallback.
+	if strings.TrimSpace(opts.SSHKey) != "" && mode != AuthHTTPS {
+		if _, err := NonInteractiveEnvWithKey(opts.SSHKey); err != nil {
+			var tErr *TransportError
+			if errors.As(err, &tErr) && tErr.URL == "" {
+				tErr.URL = norm.Redacted
+			}
+			return ProbeResult{}, err
+		}
 	}
 
 	type candidate struct {
@@ -356,7 +463,11 @@ func (a *Adapter) Probe(ctx context.Context, rawURL, ref string, mode AuthMode) 
 
 	var lastErr error
 	for _, cand := range candidates {
-		sha, err := a.lsRemote(ctx, cand.url, ref, cand.transport)
+		sshKey := ""
+		if cand.transport == "ssh" {
+			sshKey = opts.SSHKey
+		}
+		sha, err := a.lsRemote(ctx, cand.url, ref, cand.transport, sshKey)
 		if err == nil {
 			return ProbeResult{
 				Normalized:  norm,
@@ -377,13 +488,27 @@ func (a *Adapter) Probe(ctx context.Context, rawURL, ref string, mode AuthMode) 
 	return ProbeResult{}, lastErr
 }
 
-func (a *Adapter) lsRemote(ctx context.Context, targetURL, ref, transport string) (string, error) {
+// VerifySSHAccess forces SSH transport and verifies that a remote repository (such as a private repo)
+// can be queried/cloned via SSH using the configured key (or default ssh-agent when sshKey is empty).
+func (a *Adapter) VerifySSHAccess(ctx context.Context, rawURL string, sshKey string) (ProbeResult, error) {
+	return a.ProbeWithOptions(ctx, rawURL, ProbeOptions{
+		Auth:   AuthSSH,
+		SSHKey: sshKey,
+	})
+}
+
+func (a *Adapter) lsRemote(ctx context.Context, targetURL, ref, transport, sshKey string) (string, error) {
 	timeout := a.Timeout
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
 	pCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	env, err := NonInteractiveEnvWithKey(sshKey)
+	if err != nil {
+		return "", err
+	}
 
 	args := []string{"ls-remote", "--exit-code", targetURL}
 	if strings.TrimSpace(ref) != "" {
@@ -396,7 +521,7 @@ func (a *Adapter) lsRemote(ctx context.Context, targetURL, ref, transport string
 	if runner == nil {
 		runner = execRunner{}
 	}
-	stdout, stderr, err := runner.Run(pCtx, NonInteractiveEnv(), "", "git", args...)
+	stdout, stderr, err := runner.Run(pCtx, env, "", "git", args...)
 	if err != nil {
 		return "", classifyGitError(targetURL, ref, transport, stderr, err)
 	}
@@ -409,16 +534,21 @@ func (a *Adapter) lsRemote(ctx context.Context, targetURL, ref, transport string
 
 // CloneOptions configures a non-interactive Git clone.
 type CloneOptions struct {
-	URL   string
-	Ref   string
-	Dest  string
-	Depth int
-	Auth  AuthMode
+	URL    string
+	Ref    string
+	Dest   string
+	Depth  int
+	Auth   AuthMode
+	SSHKey string
 }
 
 // Clone probes and clones a repository into Dest using the selected transport.
 func (a *Adapter) Clone(ctx context.Context, opts CloneOptions) (ProbeResult, error) {
-	probe, err := a.Probe(ctx, opts.URL, opts.Ref, opts.Auth)
+	probe, err := a.ProbeWithOptions(ctx, opts.URL, ProbeOptions{
+		Auth:   opts.Auth,
+		Ref:    opts.Ref,
+		SSHKey: opts.SSHKey,
+	})
 	if err != nil {
 		return ProbeResult{}, err
 	}
@@ -428,6 +558,15 @@ func (a *Adapter) Clone(ctx context.Context, opts CloneOptions) (ProbeResult, er
 
 	if err := os.MkdirAll(filepath.Dir(opts.Dest), 0o755); err != nil {
 		return ProbeResult{}, fmt.Errorf("creating parent directory %s: %w", filepath.Dir(opts.Dest), err)
+	}
+
+	sshKey := ""
+	if probe.Transport == "ssh" {
+		sshKey = opts.SSHKey
+	}
+	env, err := NonInteractiveEnvWithKey(sshKey)
+	if err != nil {
+		return ProbeResult{}, err
 	}
 
 	args := []string{"clone"}
@@ -440,13 +579,13 @@ func (a *Adapter) Clone(ctx context.Context, opts CloneOptions) (ProbeResult, er
 	if runner == nil {
 		runner = execRunner{}
 	}
-	_, stderr, err := runner.Run(ctx, NonInteractiveEnv(), "", "git", args...)
+	_, stderr, err := runner.Run(ctx, env, "", "git", args...)
 	if err != nil {
 		return ProbeResult{}, classifyGitError(probe.Normalized.Redacted, opts.Ref, probe.Transport, stderr, err)
 	}
 
 	if ref := strings.TrimSpace(opts.Ref); ref != "" {
-		_, coErrStr, coErr := runner.Run(ctx, NonInteractiveEnv(), opts.Dest, "git", "checkout", ref)
+		_, coErrStr, coErr := runner.Run(ctx, env, opts.Dest, "git", "checkout", ref)
 		if coErr != nil {
 			return ProbeResult{}, &TransportError{
 				Kind:        ErrKindInvalidRef,
@@ -462,8 +601,23 @@ func (a *Adapter) Clone(ctx context.Context, opts CloneOptions) (ProbeResult, er
 	return probe, nil
 }
 
+// UpdateOptions configures a non-interactive Git update.
+type UpdateOptions struct {
+	Dir    string
+	Ref    string
+	SSHKey string
+}
+
 // Update fetches and fast-forwards an existing Git checkout safely in non-interactive mode.
 func (a *Adapter) Update(ctx context.Context, dir, ref string) error {
+	return a.UpdateWithOptions(ctx, UpdateOptions{
+		Dir: dir,
+		Ref: ref,
+	})
+}
+
+// UpdateWithOptions fetches and fast-forwards an existing Git checkout using optional explicit SSH key.
+func (a *Adapter) UpdateWithOptions(ctx context.Context, opts UpdateOptions) error {
 	runner := a.Runner
 	if runner == nil {
 		runner = execRunner{}
@@ -475,26 +629,31 @@ func (a *Adapter) Update(ctx context.Context, dir, ref string) error {
 	uCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	if _, stderr, err := runner.Run(uCtx, NonInteractiveEnv(), dir, "git", "fetch", "--prune", "origin"); err != nil {
-		return classifyGitError(dir, ref, "git", stderr, err)
+	env, err := NonInteractiveEnvWithKey(opts.SSHKey)
+	if err != nil {
+		return err
 	}
-	targetRef := strings.TrimSpace(ref)
+
+	if _, stderr, err := runner.Run(uCtx, env, opts.Dir, "git", "fetch", "--prune", "origin"); err != nil {
+		return classifyGitError(opts.Dir, opts.Ref, "git", stderr, err)
+	}
+	targetRef := strings.TrimSpace(opts.Ref)
 	if targetRef != "" {
-		if _, stderr, err := runner.Run(uCtx, NonInteractiveEnv(), dir, "git", "checkout", targetRef); err != nil {
+		if _, stderr, err := runner.Run(uCtx, env, opts.Dir, "git", "checkout", targetRef); err != nil {
 			return &TransportError{
 				Kind:   ErrKindInvalidRef,
-				URL:    dir,
+				URL:    opts.Dir,
 				Detail: strings.TrimSpace(stderr),
 				Cause:  err,
 			}
 		}
 	}
-	if _, stderr, err := runner.Run(uCtx, NonInteractiveEnv(), dir, "git", "pull", "--ff-only"); err != nil {
+	if _, stderr, err := runner.Run(uCtx, env, opts.Dir, "git", "pull", "--ff-only"); err != nil {
 		// Detached HEAD on tag/commit cannot pull --ff-only; treat as already at ref.
 		if strings.Contains(stderr, "not currently on a branch") {
 			return nil
 		}
-		return classifyGitError(dir, targetRef, "git", stderr, err)
+		return classifyGitError(opts.Dir, targetRef, "git", stderr, err)
 	}
 	return nil
 }
@@ -532,7 +691,9 @@ func classifyGitError(rawURL, ref, transport, stderr string, cause error) *Trans
 		strings.Contains(lower, "could not read username") ||
 		strings.Contains(lower, "authentication failed") ||
 		strings.Contains(lower, "terminal prompts disabled") ||
-		strings.Contains(lower, "host key verification failed"):
+		strings.Contains(lower, "host key verification failed") ||
+		strings.Contains(lower, "no such identity") ||
+		strings.Contains(lower, "invalid format"):
 		rem := "Ensure your SSH key is loaded in ssh-agent (ssh-add -l) and known_hosts is populated, or configure a Git HTTPS credential helper"
 		if transport == "ssh" {
 			rem = "SSH authentication failed: verify ssh-agent has an authorized key (ssh-add -l) and host key is in ~/.ssh/known_hosts"

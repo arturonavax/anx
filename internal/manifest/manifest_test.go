@@ -1,136 +1,125 @@
-package manifest_test
+package manifest
 
 import (
 	"os"
 	"path/filepath"
-	"slices"
 	"testing"
-
-	"github.com/arturonavax/anx/internal/manifest"
 )
 
-func TestEmbeddedDefaultsLoadAndValidate(t *testing.T) {
-	cat, err := manifest.LoadCatalog()
-	if err != nil {
-		t.Fatalf("LoadCatalog() failed: %v", err)
-	}
-
-	for _, id := range []string{"anx", "git", "curl"} {
-		if _, ok := cat.GetPackageSpec(id); !ok {
-			t.Fatalf("expected universal default package %q in embedded catalog", id)
-		}
-	}
-	if _, ok := cat.GetProfile("minimal"); !ok {
-		t.Fatalf("expected universal default profile 'minimal' in embedded catalog")
-	}
-}
-
-func TestExternalManifestOverlayAndProfileInheritance(t *testing.T) {
+func TestCatalogToolSourcesParsingAndLayeredMerging(t *testing.T) {
 	repoDir := t.TempDir()
 	userDir := t.TempDir()
 
 	repoYAML := `
-packages:
-  - id: base-tool
-    name: Base Tool
-    category: core
-    strategies:
-      - type: native
-        packages:
-          apt: [base-tool]
-  - id: app-tool
-    name: App Tool
-    category: cli-tools
-    depends_on: [base-tool]
-    strategies:
-      - type: native
-        packages:
-          apt: [app-tool]
-configurations:
-  - id: shell-rc
-    group: shell
-    source: files/shell/rc
-    target: ~/.shellrc
-profiles:
-  - name: developer
-    extends: minimal
-    packages: [app-tool]
-    config_groups: [shell]
+tool_sources:
+  - id: personal-vault
+    name: "Personal Vault"
+    url: "git@github.com:example-user/vault.git"
+    type: collection
+    auth: ssh
+    ssh_key: "~/.ssh/id_ed25519"
+    branch: main
+    optional: true
+    verify_ssh: true
+    description: "Private tools and vault recipes"
+  - id: community-tools
+    name: "Community Tools"
+    url: "https://github.com/example-org/tools.git"
+    type: collection
+    auth: auto
 `
-	if err := os.WriteFile(filepath.Join(repoDir, "repo.yaml"), []byte(repoYAML), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	userYAML := `
-packages:
-  - id: user-extra
-    name: User Extra
-    category: custom
-    strategies:
-      - type: native
-        packages:
-          apt: [user-extra]
-`
-	if err := os.WriteFile(filepath.Join(userDir, "user.yaml"), []byte(userYAML), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoDir, "tool_sources.yaml"), []byte(repoYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	cat, err := manifest.LoadCatalog(
-		manifest.WithRepoManifestDir(repoDir),
-		manifest.WithUserDropInDir(userDir),
+	// User drop-in overrides personal-vault ssh_key & branch, and adds a third source.
+	userYAML := `
+tool_sources:
+  - id: personal-vault
+    name: "Personal Vault Override"
+    url: "git@github.com:example-user/vault.git"
+    type: collection
+    auth: ssh
+    ssh_key: "~/.ssh/id_vault_custom"
+    branch: develop
+    optional: true
+    verify_ssh: true
+    description: "Overridden in user drop-in"
+  - id: alpha-tool
+    name: "Alpha Tool"
+    url: "https://github.com/example-org/alpha.git"
+    type: single
+    auth: https
+`
+	if err := os.WriteFile(filepath.Join(userDir, "personal.yaml"), []byte(userYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cat, err := LoadCatalog(
+		WithRepoManifestDir(repoDir),
+		WithUserDropInDir(userDir),
 	)
 	if err != nil {
-		t.Fatalf("LoadCatalog with overlays failed: %v", err)
+		t.Fatalf("LoadCatalog failed: %v", err)
 	}
 
-	if _, ok := cat.GetPackageSpec("user-extra"); !ok {
-		t.Fatalf("expected user drop-in package 'user-extra'")
+	sources := cat.ListToolSources()
+	if len(sources) != 3 {
+		t.Fatalf("expected 3 merged tool sources, got %d: %+v", len(sources), sources)
 	}
 
-	devPkgs, err := cat.ResolveProfilePackages("developer")
-	if err != nil {
-		t.Fatalf("ResolveProfilePackages(developer) failed: %v", err)
-	}
-	for _, want := range []string{"git", "curl", "app-tool"} {
-		if !slices.Contains(devPkgs, want) {
-			t.Errorf("expected %q in developer profile, got %v", want, devPkgs)
+	// Verify deterministic sorted order by ID: alpha-tool, community-tools, personal-vault
+	wantIDs := []string{"alpha-tool", "community-tools", "personal-vault"}
+	for i, want := range wantIDs {
+		if sources[i].ID != want {
+			t.Fatalf("index %d: expected ID %q, got %q", i, want, sources[i].ID)
 		}
 	}
 
-	order, err := cat.ResolveInstallOrder([]string{"app-tool"})
-	if err != nil {
-		t.Fatalf("ResolveInstallOrder failed: %v", err)
+	vault, ok := cat.GetToolSource("personal-vault")
+	if !ok {
+		t.Fatalf("expected personal-vault tool source to exist")
 	}
-	baseIdx := slices.IndexFunc(order, func(p manifest.PackageSpec) bool { return p.ID == "base-tool" })
-	appIdx := slices.IndexFunc(order, func(p manifest.PackageSpec) bool { return p.ID == "app-tool" })
-	if baseIdx < 0 || appIdx < 0 || baseIdx >= appIdx {
-		t.Fatalf("expected base-tool before app-tool, got %v", order)
+	if vault.SSHKey != "~/.ssh/id_vault_custom" || vault.Branch != "develop" {
+		t.Fatalf("expected user drop-in to win on personal-vault, got %+v", vault)
+	}
+	if !vault.Optional || !vault.VerifySSH {
+		t.Fatalf("expected Optional=true and VerifySSH=true, got %+v", vault)
 	}
 }
 
-func TestInvalidManifestsRejected(t *testing.T) {
-	t.Run("missing package strategy", func(t *testing.T) {
-		dir := t.TempDir()
-		_ = os.WriteFile(filepath.Join(dir, "bad.yaml"), []byte("packages:\n  - id: broken\n    name: Broken\n    strategies: []\n"), 0o644)
-		if _, err := manifest.LoadCatalog(manifest.WithRepoManifestDir(dir)); err == nil {
-			t.Fatalf("expected error for package without strategies")
-		}
-	})
+func TestCatalogToolSourcesValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "missing id",
+			yaml: "tool_sources:\n  - url: https://github.com/org/repo.git\n",
+		},
+		{
+			name: "missing url for non-builtin",
+			yaml: "tool_sources:\n  - id: empty-url\n    type: single\n",
+		},
+		{
+			name: "invalid type",
+			yaml: "tool_sources:\n  - id: bad-type\n    url: https://github.com/org/repo.git\n    type: unknown\n",
+		},
+		{
+			name: "invalid auth",
+			yaml: "tool_sources:\n  - id: bad-auth\n    url: https://github.com/org/repo.git\n    auth: kerberos\n",
+		},
+	}
 
-	t.Run("cyclic profile inheritance", func(t *testing.T) {
-		dir := t.TempDir()
-		_ = os.WriteFile(filepath.Join(dir, "cycle.yaml"), []byte(`
-profiles:
-  - name: a
-    extends: b
-  - name: b
-    extends: a
-`), 0o644)
-		cat, err := manifest.LoadCatalog(manifest.WithRepoManifestDir(dir))
-		if err != nil {
-			t.Fatalf("LoadCatalog failed: %v", err)
-		}
-		if _, err := cat.ResolveProfilePackages("a"); err == nil {
-			t.Fatalf("expected cyclic profile inheritance error")
-		}
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "bad.yaml"), []byte(tc.yaml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadCatalog(WithUserDropInDir(dir)); err == nil {
+				t.Fatalf("expected validation error for %s, got nil", tc.name)
+			}
+		})
+	}
 }

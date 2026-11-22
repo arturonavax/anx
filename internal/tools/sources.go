@@ -35,6 +35,8 @@ type ToolSource struct {
 	Path     string         `json:"path,omitempty" yaml:"path,omitempty"`
 	Ref      string         `json:"ref,omitempty" yaml:"ref,omitempty"`
 	Auth     string         `json:"auth,omitempty" yaml:"auth,omitempty"`
+	SSHKey   string         `json:"ssh_key,omitempty" yaml:"ssh_key,omitempty"`
+	Optional bool           `json:"optional,omitempty" yaml:"optional,omitempty"`
 	Priority int            `json:"priority,omitempty" yaml:"priority,omitempty"`
 	Enabled  *bool          `json:"enabled,omitempty" yaml:"enabled,omitempty"`
 }
@@ -292,13 +294,22 @@ func (m *SourceManager) UpdateSource(ctx context.Context, id string) ([]Resolved
 			return nil, err
 		}
 		if s.URL != "" && !gittransport.NormalizeURL(s.URL).IsLocal {
-			if err := m.git().Update(ctx, dir, s.Ref); err != nil {
+			if err := m.git().UpdateWithOptions(ctx, gittransport.UpdateOptions{
+				Dir:    dir,
+				Ref:    s.Ref,
+				SSHKey: s.SSHKey,
+			}); err != nil {
 				return nil, err
 			}
 		}
 		return m.discoverFromDir(s, dir)
 	}
 	return nil, fmt.Errorf("tool source %q not found", id)
+}
+
+// VerifySSHAccess verifies that a remote SSH repository can be queried/cloned with the given SSH key.
+func (m *SourceManager) VerifySSHAccess(ctx context.Context, rawURL, sshKey string) (gittransport.ProbeResult, error) {
+	return m.git().VerifySSHAccess(ctx, rawURL, sshKey)
 }
 
 // VerifySource validates a source's accessibility and manifest schemas without mutating binaries.
@@ -318,7 +329,11 @@ func (m *SourceManager) VerifySource(ctx context.Context, id string) ([]Resolved
 		if _, err := os.Stat(dir); err != nil {
 			if s.URL != "" {
 				mode, _ := gittransport.ParseAuthMode(s.Auth)
-				if _, pErr := m.git().Probe(ctx, s.URL, s.Ref, mode); pErr != nil {
+				if _, pErr := m.git().ProbeWithOptions(ctx, s.URL, gittransport.ProbeOptions{
+					Auth:   mode,
+					Ref:    s.Ref,
+					SSHKey: s.SSHKey,
+				}); pErr != nil {
 					return nil, pErr
 				}
 			}
@@ -520,11 +535,12 @@ func (m *SourceManager) ensureSourceDir(ctx context.Context, s ToolSource, allow
 		return "", err
 	}
 	_, err = m.git().Clone(ctx, gittransport.CloneOptions{
-		URL:   s.URL,
-		Ref:   s.Ref,
-		Dest:  dest,
-		Depth: 1,
-		Auth:  mode,
+		URL:    s.URL,
+		Ref:    s.Ref,
+		Dest:   dest,
+		Depth:  1,
+		Auth:   mode,
+		SSHKey: s.SSHKey,
 	})
 	if err != nil {
 		return "", err

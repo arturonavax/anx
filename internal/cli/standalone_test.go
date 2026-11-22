@@ -2,12 +2,15 @@ package cli_test
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/arturonavax/anx/internal/cli"
+	"github.com/arturonavax/anx/internal/gittransport"
 )
 
 func TestANXStandaloneIndependenceAndExternalManifestVerification(t *testing.T) {
@@ -87,5 +90,190 @@ profiles:
 	errOut.Reset()
 	if code := cli.ExecuteCLI([]string{"repo", "verify"}, &out, &errOut, "2.0.0-test", "", ""); code == 0 {
 		t.Fatalf("expected repo verify to fail for invalid manifest, got exit 0:\n%s", out.String())
+	}
+}
+
+type fakeCLIGitRunner struct {
+	fn func(ctx context.Context, env []string, dir string, name string, args ...string) (string, string, error)
+}
+
+func (f fakeCLIGitRunner) Run(ctx context.Context, env []string, dir string, name string, args ...string) (string, string, error) {
+	return f.fn(ctx, env, dir, name, args...)
+}
+
+func TestCLIToolsSourceSSHKeyAndVerifyAndRepoSSHKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Setenv("ANX_CONFIG_REPO", "")
+	t.Setenv("ANX_REPO", "")
+	t.Setenv("ANX_SSH_KEY", "")
+
+	keyPath := filepath.Join(home, ".ssh", "id_vault")
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte("fake-private-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var seenSSHCmds []string
+	failAuth := false
+	restore := cli.SetGitAdapterFactoryForTest(func() *gittransport.Adapter {
+		return &gittransport.Adapter{
+			Runner: fakeCLIGitRunner{fn: func(_ context.Context, env []string, _ string, _ string, args ...string) (string, string, error) {
+				for _, kv := range env {
+					if strings.HasPrefix(kv, "GIT_SSH_COMMAND=") {
+						seenSSHCmds = append(seenSSHCmds, kv)
+					}
+				}
+				if failAuth {
+					return "", "git@github.com: Permission denied (publickey).", errors.New("exit 128")
+				}
+				if len(args) > 0 && args[0] == "ls-remote" {
+					return "cafebabe\tHEAD\n", "", nil
+				}
+				if len(args) > 0 && args[0] == "clone" {
+					dest := args[len(args)-1]
+					if err := os.MkdirAll(filepath.Join(dest, "bin"), 0o755); err != nil {
+						return "", err.Error(), err
+					}
+					if err := os.MkdirAll(filepath.Join(dest, "manifests"), 0o755); err != nil {
+						return "", err.Error(), err
+					}
+					if err := os.WriteFile(filepath.Join(dest, "tool.yaml"), []byte(`
+schema_version: 1
+id: vault-cli
+name: "Vault CLI"
+executable: vault-cli
+entrypoint: bin/vault.sh
+language: bash
+`), 0o644); err != nil {
+						return "", err.Error(), err
+					}
+					if err := os.WriteFile(filepath.Join(dest, "bin", "vault.sh"), []byte("#!/bin/sh\necho vault\n"), 0o755); err != nil {
+						return "", err.Error(), err
+					}
+					return "", "", nil
+				}
+				return "", "", nil
+			}},
+		}
+	})
+	defer restore()
+
+	// 1. Direct SSH URL verification via `anx tools source verify <url> --ssh-key <key>`
+	var out, errOut bytes.Buffer
+	code := cli.ExecuteCLI(
+		[]string{"tools", "source", "verify", "git@github.com:example-org/vault.git", "--ssh-key", keyPath},
+		&out,
+		&errOut,
+		"2.0.0-test",
+		"",
+		"",
+	)
+	if code != 0 {
+		t.Fatalf("tools source verify URL failed (%d): stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "SSH access verified") {
+		t.Fatalf("expected SSH access verified in stdout, got:\n%s", out.String())
+	}
+	if len(seenSSHCmds) == 0 || !strings.Contains(seenSSHCmds[0], "id_vault") {
+		t.Fatalf("expected GIT_SSH_COMMAND with id_vault, got %v", seenSSHCmds)
+	}
+
+	// 2. Auth failure on verify returns non-zero with clear error
+	failAuth = true
+	out.Reset()
+	errOut.Reset()
+	code = cli.ExecuteCLI(
+		[]string{"tools", "source", "verify", "git@github.com:example-org/vault.git", "--ssh-key", keyPath},
+		&out,
+		&errOut,
+		"2.0.0-test",
+		"",
+		"",
+	)
+	if code == 0 {
+		t.Fatalf("expected verify to fail on SSH auth error, got exit 0")
+	}
+	failAuth = false
+
+	// 3. `anx tools source add` with `--ssh-key` and `--optional`
+	seenSSHCmds = nil
+	out.Reset()
+	errOut.Reset()
+	code = cli.ExecuteCLI(
+		[]string{"tools", "source", "add", "git@github.com:example-org/vault.git", "--id", "vault", "--ssh-key", keyPath, "--optional"},
+		&out,
+		&errOut,
+		"2.0.0-test",
+		"",
+		"",
+	)
+	if code != 0 {
+		t.Fatalf("tools source add --ssh-key failed (%d): stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "SSH access verified") || !strings.Contains(out.String(), `Added tool source "vault"`) {
+		t.Fatalf("unexpected add output:\n%s", out.String())
+	}
+
+	// 4. Verify registered source by ID uses its stored SSH key
+	seenSSHCmds = nil
+	out.Reset()
+	errOut.Reset()
+	code = cli.ExecuteCLI(
+		[]string{"tools", "source", "verify", "vault"},
+		&out,
+		&errOut,
+		"2.0.0-test",
+		"",
+		"",
+	)
+	if code != 0 {
+		t.Fatalf("tools source verify vault failed (%d): stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "SSH access verified") || !strings.Contains(out.String(), `Verified tool source "vault"`) {
+		t.Fatalf("unexpected verify output:\n%s", out.String())
+	}
+
+	// 5. `anx repo clone` defaults to https://github.com/arturonavax/env and supports --ssh-key
+	out.Reset()
+	errOut.Reset()
+	code = cli.ExecuteCLI(
+		[]string{"repo", "clone", "--dry-run"},
+		&out,
+		&errOut,
+		"2.0.0-test",
+		"",
+		"",
+	)
+	if code != 0 {
+		t.Fatalf("repo clone --dry-run failed (%d): %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), cli.DefaultConfigRepoURL) {
+		t.Fatalf("expected default config repo %q in dry-run output, got:\n%s", cli.DefaultConfigRepoURL, out.String())
+	}
+
+	seenSSHCmds = nil
+	out.Reset()
+	errOut.Reset()
+	repoDest := filepath.Join(home, "private-env-checkout")
+	code = cli.ExecuteCLI(
+		[]string{"repo", "clone", "git@github.com:example-org/private-env.git", "--dir", repoDest, "--auth", "ssh", "--ssh-key", keyPath},
+		&out,
+		&errOut,
+		"2.0.0-test",
+		"",
+		"",
+	)
+	if code != 0 {
+		t.Fatalf("repo clone --ssh-key failed (%d): stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if len(seenSSHCmds) == 0 || !strings.Contains(seenSSHCmds[0], "id_vault") {
+		t.Fatalf("expected repo clone to forward --ssh-key in GIT_SSH_COMMAND, got %v", seenSSHCmds)
 	}
 }

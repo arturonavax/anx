@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -20,6 +21,35 @@ import (
 
 // DefaultConfigRepoURL is the default declarative configuration repository.
 const DefaultConfigRepoURL = "https://github.com/arturonavax/env"
+
+var (
+	gitAdapterMu      sync.RWMutex
+	gitAdapterFactory = gittransport.NewAdapter
+)
+
+func newGitAdapter() *gittransport.Adapter {
+	gitAdapterMu.RLock()
+	fn := gitAdapterFactory
+	gitAdapterMu.RUnlock()
+	if fn != nil {
+		return fn()
+	}
+	return gittransport.NewAdapter()
+}
+
+// SetGitAdapterFactoryForTest overrides the gittransport adapter factory during tests
+// and returns a restore function.
+func SetGitAdapterFactoryForTest(fn func() *gittransport.Adapter) func() {
+	gitAdapterMu.Lock()
+	prev := gitAdapterFactory
+	gitAdapterFactory = fn
+	gitAdapterMu.Unlock()
+	return func() {
+		gitAdapterMu.Lock()
+		gitAdapterFactory = prev
+		gitAdapterMu.Unlock()
+	}
+}
 
 type repoStatusInfo struct {
 	RepoRoot      string `json:"repo_root"`
@@ -92,6 +122,23 @@ func resolveConfigRef(appCtx *AppContext, explicit string) string {
 	return ""
 }
 
+func resolveConfigSSHKey(appCtx *AppContext, explicit string) string {
+	for _, cand := range []string{
+		explicit,
+		os.Getenv("ANX_SSH_KEY"),
+	} {
+		if strings.TrimSpace(cand) != "" {
+			return strings.TrimSpace(cand)
+		}
+	}
+	if appCtx.Viper != nil {
+		if v := strings.TrimSpace(appCtx.Viper.GetString("config_ssh_key")); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func newRepoStatusCmd(appCtx *AppContext) *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
@@ -155,6 +202,7 @@ func newRepoCloneCmd(appCtx *AppContext) *cobra.Command {
 		depth     int
 		ref       string
 		authMode  string
+		sshKey    string
 	)
 	cmd := &cobra.Command{
 		Use:   "clone [url]",
@@ -169,6 +217,7 @@ Defaults to 'https://github.com/arturonavax/env' (or ANX_CONFIG_REPO) into '~/.l
 			}
 			repoURL := resolveConfigRepoURL(appCtx, explicit)
 			chosenRef := resolveConfigRef(appCtx, ref)
+			chosenSSHKey := resolveConfigSSHKey(appCtx, sshKey)
 			mode, err := gittransport.ParseAuthMode(authMode)
 			if err != nil {
 				return domain.NewExitError(domain.ExitUsageError, err)
@@ -191,18 +240,22 @@ Defaults to 'https://github.com/arturonavax/env' (or ANX_CONFIG_REPO) into '~/.l
 			}
 
 			fmt.Fprintf(cmd.OutOrStdout(), "Cloning configuration repository from %s into %s...\n", gittransport.NormalizeURL(repoURL).Redacted, dest)
-			adapter := gittransport.NewAdapter()
+			adapter := newGitAdapter()
 			probe, err := adapter.Clone(cmd.Context(), gittransport.CloneOptions{
-				URL:   repoURL,
-				Ref:   chosenRef,
-				Dest:  dest,
-				Depth: depth,
-				Auth:  mode,
+				URL:    repoURL,
+				Ref:    chosenRef,
+				Dest:   dest,
+				Depth:  depth,
+				Auth:   mode,
+				SSHKey: chosenSSHKey,
 			})
 			if err != nil {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Transport selected: %s (%s)\n", probe.Transport, probe.Normalized.Redacted)
+			if chosenSSHKey != "" && appCtx.Platform != nil {
+				_ = persistRepoSSHKey(appCtx.Platform.ConfigDir(), chosenSSHKey)
+			}
 			return linkRepoRoot(appCtx, dest, probe.Normalized.Redacted, chosenRef, cmd.OutOrStdout())
 		},
 	}
@@ -211,6 +264,7 @@ Defaults to 'https://github.com/arturonavax/env' (or ANX_CONFIG_REPO) into '~/.l
 	cmd.Flags().IntVar(&depth, "depth", 1, "Shallow clone depth (0 for full history)")
 	cmd.Flags().StringVar(&ref, "ref", "", "Branch, tag, or commit to checkout")
 	cmd.Flags().StringVar(&authMode, "auth", "auto", "Git authentication mode (auto|ssh|https)")
+	cmd.Flags().StringVar(&sshKey, "ssh-key", "", "Path to SSH private key for private Git repositories")
 	return cmd
 }
 
@@ -219,6 +273,7 @@ func newRepoSetCmd(appCtx *AppContext) *cobra.Command {
 		force    bool
 		ref      string
 		authMode string
+		sshKey   string
 	)
 	cmd := &cobra.Command{
 		Use:   "set <path-or-url>",
@@ -227,6 +282,7 @@ func newRepoSetCmd(appCtx *AppContext) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			raw := strings.TrimSpace(args[0])
 			chosenRef := resolveConfigRef(appCtx, ref)
+			chosenSSHKey := resolveConfigSSHKey(appCtx, sshKey)
 			norm := gittransport.NormalizeURL(raw)
 
 			if !norm.IsLocal {
@@ -245,16 +301,20 @@ func newRepoSetCmd(appCtx *AppContext) *cobra.Command {
 						return fmt.Errorf("clearing previous repo cache %s: %w", dest, err)
 					}
 				}
-				adapter := gittransport.NewAdapter()
+				adapter := newGitAdapter()
 				probe, err := adapter.Clone(cmd.Context(), gittransport.CloneOptions{
-					URL:   raw,
-					Ref:   chosenRef,
-					Dest:  dest,
-					Depth: 1,
-					Auth:  mode,
+					URL:    raw,
+					Ref:    chosenRef,
+					Dest:   dest,
+					Depth:  1,
+					Auth:   mode,
+					SSHKey: chosenSSHKey,
 				})
 				if err != nil {
 					return err
+				}
+				if chosenSSHKey != "" && appCtx.Platform != nil {
+					_ = persistRepoSSHKey(appCtx.Platform.ConfigDir(), chosenSSHKey)
 				}
 				return linkRepoRoot(appCtx, dest, probe.Normalized.Redacted, chosenRef, cmd.OutOrStdout())
 			}
@@ -283,11 +343,15 @@ func newRepoSetCmd(appCtx *AppContext) *cobra.Command {
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "Link directory even if manifests/ or files/ are not detected")
 	cmd.Flags().StringVar(&ref, "ref", "", "Git branch, tag, or commit to pin")
 	cmd.Flags().StringVar(&authMode, "auth", "auto", "Git authentication mode (auto|ssh|https)")
+	cmd.Flags().StringVar(&sshKey, "ssh-key", "", "Path to SSH private key for private Git repositories")
 	return cmd
 }
 
 func newRepoUpdateCmd(appCtx *AppContext) *cobra.Command {
-	var ref string
+	var (
+		ref    string
+		sshKey string
+	)
 	cmd := &cobra.Command{
 		Use:   "update",
 		Short: "Fetch and fast-forward updates for the linked Git configuration repository",
@@ -298,12 +362,17 @@ func newRepoUpdateCmd(appCtx *AppContext) *cobra.Command {
 				return domain.NewExitError(domain.ExitPreflightFailed, fmt.Errorf("%s is not a git repository; nothing to update", root))
 			}
 			chosenRef := resolveConfigRef(appCtx, ref)
+			chosenSSHKey := resolveConfigSSHKey(appCtx, sshKey)
 			if appCtx.Flags.DryRun {
 				fmt.Fprintf(cmd.OutOrStdout(), "dry-run: would update git repository at %s (ref=%q)\n", root, chosenRef)
 				return nil
 			}
-			adapter := gittransport.NewAdapter()
-			if err := adapter.Update(cmd.Context(), root, chosenRef); err != nil {
+			adapter := newGitAdapter()
+			if err := adapter.UpdateWithOptions(cmd.Context(), gittransport.UpdateOptions{
+				Dir:    root,
+				Ref:    chosenRef,
+				SSHKey: chosenSSHKey,
+			}); err != nil {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Updated configuration repository at %s\n", root)
@@ -311,6 +380,7 @@ func newRepoUpdateCmd(appCtx *AppContext) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&ref, "ref", "", "Optional branch, tag, or commit to checkout")
+	cmd.Flags().StringVar(&sshKey, "ssh-key", "", "Path to SSH private key for private Git repositories")
 	return cmd
 }
 
@@ -432,6 +502,23 @@ func persistRepoConfig(configDir, repoPath, sourceURL, ref string) error {
 	return os.WriteFile(cfgPath, out, 0o644)
 }
 
+func persistRepoSSHKey(configDir, sshKey string) error {
+	cfgPath := filepath.Join(configDir, "config.yaml")
+	data := map[string]any{}
+	if raw, err := os.ReadFile(cfgPath); err == nil {
+		_ = yaml.Unmarshal(raw, &data)
+	}
+	data["config_ssh_key"] = sshKey
+	out, err := yaml.Marshal(data)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(cfgPath, out, 0o644)
+}
+
 func inspectRepoStatus(ctx context.Context, root string) repoStatusInfo {
 	info := repoStatusInfo{
 		RepoRoot:     root,
@@ -493,13 +580,14 @@ func ensureDotfilesRepo(cmd *cobra.Command, appCtx *AppContext) error {
 	}
 
 	fmt.Fprintf(cmd.OutOrStdout(), "Cloning configuration repository into %s...\n", targetDir)
-	adapter := gittransport.NewAdapter()
+	adapter := newGitAdapter()
 	probe, err := adapter.Clone(cmd.Context(), gittransport.CloneOptions{
-		URL:   defaultURL,
-		Ref:   chosenRef,
-		Dest:  targetDir,
-		Depth: 1,
-		Auth:  gittransport.AuthAuto,
+		URL:    defaultURL,
+		Ref:    chosenRef,
+		Dest:   targetDir,
+		Depth:  1,
+		Auth:   gittransport.AuthAuto,
+		SSHKey: resolveConfigSSHKey(appCtx, ""),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to clone configuration repository: %w", err)

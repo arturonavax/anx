@@ -33,7 +33,9 @@ func toolSourceManager(appCtx *AppContext) *tools.SourceManager {
 	if bundledDir == "" && isDir("tools/bundled") {
 		bundledDir, _ = filepath.Abs("tools/bundled")
 	}
-	return tools.NewSourceManager(cfgDir, dataDir, binDir, bundledDir)
+	mgr := tools.NewSourceManager(cfgDir, dataDir, binDir, bundledDir)
+	mgr.Git = newGitAdapter()
+	return mgr
 }
 
 func newToolsInstallCmd(appCtx *AppContext) *cobra.Command {
@@ -146,10 +148,12 @@ func newToolsSourceCmd(appCtx *AppContext) *cobra.Command {
 	}
 
 	var (
-		srcID   string
-		srcType string
-		srcRef  string
-		srcAuth string
+		srcID       string
+		srcType     string
+		srcRef      string
+		srcAuth     string
+		srcSSHKey   string
+		srcOptional bool
 	)
 	addCmd := &cobra.Command{
 		Use:   "add <url-or-path>",
@@ -159,11 +163,14 @@ func newToolsSourceCmd(appCtx *AppContext) *cobra.Command {
 			raw := strings.TrimSpace(args[0])
 			norm := gittransport.NormalizeURL(raw)
 			src := tools.ToolSource{
-				ID:   srcID,
-				Type: tools.ToolSourceType(srcType),
-				Ref:  srcRef,
-				Auth: srcAuth,
+				ID:       srcID,
+				Type:     tools.ToolSourceType(srcType),
+				Ref:      srcRef,
+				Auth:     srcAuth,
+				SSHKey:   strings.TrimSpace(srcSSHKey),
+				Optional: srcOptional,
 			}
+			mgr := toolSourceManager(appCtx)
 			if norm.IsLocal {
 				abs, err := filepath.Abs(appCtx.Platform.ExpandPath(raw))
 				if err != nil {
@@ -172,8 +179,17 @@ func newToolsSourceCmd(appCtx *AppContext) *cobra.Command {
 				src.Path = abs
 			} else {
 				src.URL = raw
+				if src.SSHKey != "" || strings.EqualFold(src.Auth, string(gittransport.AuthSSH)) {
+					probe, err := mgr.VerifySSHAccess(cmd.Context(), raw, src.SSHKey)
+					if err != nil {
+						return err
+					}
+					fmt.Fprintf(cmd.OutOrStdout(), "SSH access verified: %s\n", probe.ResolvedURL)
+					if src.SSHKey != "" && (src.Auth == "" || strings.EqualFold(src.Auth, string(gittransport.AuthAuto))) {
+						src.Auth = string(gittransport.AuthSSH)
+					}
+				}
 			}
-			mgr := toolSourceManager(appCtx)
 			saved, discovered, err := mgr.AddSource(cmd.Context(), src)
 			if err != nil {
 				return err
@@ -189,6 +205,8 @@ func newToolsSourceCmd(appCtx *AppContext) *cobra.Command {
 	addCmd.Flags().StringVar(&srcType, "type", "", "Source type (single|collection; auto-detected if omitted)")
 	addCmd.Flags().StringVar(&srcRef, "ref", "", "Git branch, tag, or commit")
 	addCmd.Flags().StringVar(&srcAuth, "auth", "auto", "Git auth mode (auto|ssh|https)")
+	addCmd.Flags().StringVar(&srcSSHKey, "ssh-key", "", "Path to SSH private key for private Git repositories")
+	addCmd.Flags().BoolVar(&srcOptional, "optional", false, "Mark this tool source as optional (e.g., private repository)")
 
 	removeCmd := &cobra.Command{
 		Use:   "remove <id>",
@@ -219,21 +237,71 @@ func newToolsSourceCmd(appCtx *AppContext) *cobra.Command {
 		},
 	}
 
+	var (
+		verifySSHKey  string
+		verifySSHOnly bool
+	)
 	verifyCmd := &cobra.Command{
-		Use:   "verify <id>",
-		Short: "Verify a tool source's accessibility and manifest schemas",
+		Use:   "verify <id-or-url>",
+		Short: "Verify a tool source's SSH remote accessibility and manifest schemas",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			target := strings.TrimSpace(args[0])
 			mgr := toolSourceManager(appCtx)
-			found, err := mgr.VerifySource(cmd.Context(), args[0])
+			sources, err := mgr.LoadSources()
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Verified tool source %q: %d valid tool(s)\n", args[0], len(found))
-			return nil
+
+			for _, s := range sources {
+				if s.ID != target {
+					continue
+				}
+				key := strings.TrimSpace(verifySSHKey)
+				if key == "" {
+					key = s.SSHKey
+				}
+				if s.URL != "" && !gittransport.NormalizeURL(s.URL).IsLocal &&
+					(verifySSHOnly || key != "" || strings.EqualFold(s.Auth, string(gittransport.AuthSSH))) {
+					probe, pErr := mgr.VerifySSHAccess(cmd.Context(), s.URL, key)
+					if pErr != nil {
+						return pErr
+					}
+					fmt.Fprintf(cmd.OutOrStdout(), "SSH access verified for %q (%s)\n", s.ID, probe.ResolvedURL)
+					if verifySSHOnly {
+						return nil
+					}
+				}
+				found, vErr := mgr.VerifySource(cmd.Context(), s.ID)
+				if vErr != nil {
+					return vErr
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Verified tool source %q: %d valid tool(s)\n", s.ID, len(found))
+				return nil
+			}
+
+			if looksLikeRepoLocator(target) {
+				probe, pErr := mgr.VerifySSHAccess(cmd.Context(), target, strings.TrimSpace(verifySSHKey))
+				if pErr != nil {
+					return pErr
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "SSH access verified for %s (%s)\n", probe.Normalized.Redacted, probe.ResolvedURL)
+				return nil
+			}
+
+			return fmt.Errorf("tool source %q not found", target)
 		},
 	}
+	verifyCmd.Flags().StringVar(&verifySSHKey, "ssh-key", "", "Path to SSH private key for verifying SSH remote access")
+	verifyCmd.Flags().BoolVar(&verifySSHOnly, "ssh", false, "Verify SSH remote access only (without requiring local cache)")
 
 	cmd.AddCommand(listCmd, addCmd, removeCmd, updateCmd, verifyCmd)
 	return cmd
+}
+
+func looksLikeRepoLocator(s string) bool {
+	return strings.Contains(s, "://") ||
+		strings.Contains(s, "@") ||
+		strings.Contains(s, ":") ||
+		strings.Contains(s, "/")
 }
