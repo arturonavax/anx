@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ func TestParseGitRepoOwner(t *testing.T) {
 	}{
 		{"git@github.com:arturonavax/env.git", "arturonavax"},
 		{"git@github.com:octocat/my-fork.git", "octocat"},
+		{"ssh://git@code.example.invalid:2222/team/private.git", "team"},
 		{"https://github.com/arturonavax/env.git", "arturonavax"},
 		{"https://github.com/contributor/env", "contributor"},
 		{"http://gitlab.internal.corp/team-devops/configs.git", "team-devops"},
@@ -32,6 +34,54 @@ func TestParseGitRepoOwner(t *testing.T) {
 	}
 }
 
+func TestCaptureCommitExcludesUnrelatedIndexEntries(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required")
+	}
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	repo := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-q")
+	git("config", "user.name", "ANX Fixture")
+	git("config", "user.email", "fixture@example.invalid")
+	for _, path := range []string{"captured.conf", "unrelated.conf"} {
+		if err := os.WriteFile(filepath.Join(repo, path), []byte("initial\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("add", ".")
+	git("commit", "-qm", "fixture")
+	for _, path := range []string{"captured.conf", "unrelated.conf"} {
+		if err := os.WriteFile(filepath.Join(repo, path), []byte("changed\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("add", "--", "unrelated.conf")
+	appCtx := &AppContext{RepoRoot: repo, Viper: viper.New()}
+	cmd := newCaptureCmd(appCtx)
+	cmd.SetContext(context.Background())
+	if err := executeGitCommitAndPush(cmd, appCtx, "sync/capture-test", "test: capture fixture", []string{"captured.conf"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"); got != "captured.conf" {
+		t.Errorf("commit contains unrelated changes: %q", got)
+	}
+	if got := git("diff", "--cached", "--name-only"); got != "unrelated.conf" {
+		t.Errorf("unrelated index entries changed: %q", got)
+	}
+}
+
 func TestCheckGitPushAuthorization(t *testing.T) {
 	ctx := context.Background()
 
@@ -40,7 +90,7 @@ func TestCheckGitPushAuthorization(t *testing.T) {
 		RepoRoot: t.TempDir(),
 		Viper:    viper.New(),
 	}
-	resOpen := checkGitPushAuthorization(ctx, appCtxOpen)
+	resOpen := authorizeGitPush(ctx, appCtxOpen, "")
 	if !resOpen.IsAuthorized {
 		t.Errorf("expected open authorization when no restrictions configured, got denied: %s", resOpen.Reason)
 	}
@@ -57,7 +107,7 @@ func TestCheckGitPushAuthorization(t *testing.T) {
 
 	// Active user is nil/empty in test environment without git/gh user,
 	// so it should be denied against ["alice", "bob", "carol"]
-	resRestricted := checkGitPushAuthorization(ctx, appCtxRestricted)
+	resRestricted := authorizeGitPush(ctx, appCtxRestricted, "")
 	if resRestricted.IsAuthorized {
 		t.Errorf("expected unauthorized when active user is empty and not in allowed list")
 	}

@@ -613,6 +613,18 @@ func (a *Adapter) LocalOrigin(ctx context.Context, dir string) (string, error) {
 	return a.readLocalValue(ctx, dir, "config", "--local", "--get", "remote.origin.url")
 }
 
+// OriginPushURL resolves the single push destination for origin.
+func (a *Adapter) OriginPushURL(ctx context.Context, dir string) (string, error) {
+	output, err := a.readLocalValue(ctx, dir, "remote", "get-url", "--push", "--all", "origin")
+	if err != nil {
+		return "", fmt.Errorf("reading the push URL for origin: %w", err)
+	}
+	if output == "" || strings.Contains(output, "\n") {
+		return "", errors.New("origin must have exactly one push destination")
+	}
+	return output, nil
+}
+
 // LocalRevision resolves a local ref to the full ID of a commit without fetching.
 func (a *Adapter) LocalRevision(ctx context.Context, dir, ref string) (string, error) {
 	return a.readLocalValue(ctx, dir, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
@@ -625,6 +637,79 @@ func (a *Adapter) readLocalValue(ctx context.Context, dir string, args ...string
 	}
 	out, _, err := runner.Run(ctx, NonInteractiveEnv(), dir, "git", args...)
 	return strings.TrimSpace(out), err
+}
+
+// PushOptions binds a branch and verified origin URL to a push.
+type PushOptions struct {
+	Dir    string
+	URL    string
+	Branch string
+	SSHKey string
+}
+
+// ValidateBranch rejects expressions and options that are not literal branch names.
+func (a *Adapter) ValidateBranch(ctx context.Context, dir, branch string) error {
+	if branch == "" || strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("invalid branch name %q", branch)
+	}
+	resolved, err := a.readLocalValue(ctx, dir, "check-ref-format", "--branch", branch)
+	if err != nil {
+		return fmt.Errorf("invalid branch name %q: %w", branch, err)
+	}
+	if resolved != branch {
+		return fmt.Errorf("expected a literal branch name, got %q", branch)
+	}
+	return nil
+}
+
+// PushBranch publishes a branch to the configured origin without prompting or forcing.
+func (a *Adapter) PushBranch(ctx context.Context, opts PushOptions) error {
+	if err := a.ValidateBranch(ctx, opts.Dir, opts.Branch); err != nil {
+		return err
+	}
+	target, err := a.OriginPushURL(ctx, opts.Dir)
+	if err != nil {
+		return err
+	}
+	if target != opts.URL {
+		return errors.New("origin push destination changed after authorization")
+	}
+	normalized := NormalizeURL(target)
+	sshKey := ""
+	if normalized.IsSSH {
+		sshKey = opts.SSHKey
+	}
+	env, err := NonInteractiveEnvWithKey(sshKey)
+	if err != nil {
+		return err
+	}
+	if normalized.IsSSH {
+		for i, entry := range env {
+			command, ok := strings.CutPrefix(entry, "GIT_SSH_COMMAND=")
+			if !ok {
+				continue
+			}
+			if sshKey == "" {
+				command = "ssh -o BatchMode=yes -o ConnectTimeout=8"
+			}
+			env[i] = "GIT_SSH_COMMAND=" + command + " -o StrictHostKeyChecking=yes"
+		}
+	}
+	runner := a.Runner
+	if runner == nil {
+		runner = execRunner{}
+	}
+	ref := "refs/heads/" + opts.Branch
+	args := []string{"push", "--set-upstream", "--no-follow-tags", "--recurse-submodules=no", "origin", ref + ":" + ref}
+	_, stderr, err := runner.Run(ctx, env, opts.Dir, "git", args...)
+	if err != nil {
+		transport := "git"
+		if normalized.IsSSH {
+			transport = "ssh"
+		}
+		return classifyGitError(target, opts.Branch, transport, strings.ReplaceAll(stderr, target, normalized.Redacted), err)
+	}
+	return nil
 }
 
 // Update fetches and fast-forwards an existing Git checkout safely in non-interactive mode.

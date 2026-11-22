@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -61,6 +62,63 @@ func TestNonInteractiveEnvSafety(t *testing.T) {
 	}
 	if strings.Contains(joined, "StrictHostKeyChecking=no") {
 		t.Fatalf("must NEVER disable StrictHostKeyChecking")
+	}
+}
+
+func TestPushBranchUsesStrictSSHAndBindsDestination(t *testing.T) {
+	t.Setenv("GIT_SSH_COMMAND", "ssh -o StrictHostKeyChecking=no")
+	dir := t.TempDir()
+	key := filepath.Join(dir, "fixture-key")
+	if err := os.WriteFile(key, []byte("fixture only"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const target = "ssh://git@fixture.invalid:2222/team/private.git"
+	const branch = "sync/capture"
+	pushDestination := target
+	pushes := 0
+	a := &Adapter{Runner: fakeRunner{fn: func(_ context.Context, env []string, cwd, name string, args ...string) (string, string, error) {
+		if cwd != dir || name != "git" {
+			t.Errorf("expected git in %q, got %q in %q", dir, name, cwd)
+		}
+		switch args[0] {
+		case "check-ref-format":
+			return branch + "\n", "", nil
+		case "remote":
+			return pushDestination + "\n", "", nil
+		case "push":
+			pushes++
+			want := []string{
+				"push", "--set-upstream", "--no-follow-tags", "--recurse-submodules=no", "origin",
+				"refs/heads/sync/capture:refs/heads/sync/capture",
+			}
+			if !slices.Equal(args, want) {
+				t.Errorf("wanted %v, got %v", want, args)
+			}
+			processEnv := strings.Join(env, "\n")
+			for _, value := range []string{
+				"GIT_TERMINAL_PROMPT=0", " -i ", filepath.ToSlash(key), "IdentitiesOnly=yes", "StrictHostKeyChecking=yes",
+			} {
+				if !strings.Contains(processEnv, value) {
+					t.Errorf("missing %s in Git environment", value)
+				}
+			}
+			if strings.Contains(processEnv, "StrictHostKeyChecking=no") {
+				t.Error("unsafe host-key setting passed to push")
+			}
+			return "", "", nil
+		default:
+			return "", "", errors.New("unexpected Git command")
+		}
+	}}}
+	opts := PushOptions{Dir: dir, URL: target, Branch: branch, SSHKey: key}
+	if err := a.PushBranch(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	for _, destination := range []string{target + "\nhttps://other.invalid/team/env.git", "https://other.invalid/team/env.git"} {
+		pushDestination = destination
+		if err := a.PushBranch(context.Background(), opts); err == nil || pushes != 1 {
+			t.Errorf("expected URL mismatch or multiple targets to prevent push; pushes=%d err=%v", pushes, err)
+		}
 	}
 }
 

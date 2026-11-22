@@ -129,6 +129,13 @@ anx tools source update <id>
 anx tools source verify <id>
 ```
 
+To publish captured dotfiles, opt in with `anx capture --all --commit --push`.
+The push uses the environment checkout's configured `origin`; automatic
+enrollment prefers SSH when available. For a private SSH origin, configure
+`ANX_SSH_KEY` or the key saved by `anx repo clone --ssh-key`, and establish
+the server's host key before pushing. The capture commit excludes unrelated
+staged changes. Offline and dry-run modes do not push.
+
 ## Security & Git Authentication
 
 - Release checksums detect a missing or mismatched download. A checksum from

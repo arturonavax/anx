@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/arturonavax/anx/internal/app"
+	"github.com/arturonavax/anx/internal/gittransport"
 	"github.com/arturonavax/anx/internal/scriptgen"
 	"github.com/arturonavax/anx/internal/security"
 )
@@ -137,14 +138,20 @@ func runCaptureNonInteractive(
 		}
 		b := scriptgen.NewBuilder("capture", appCtx.Platform)
 		b.AddSection("Capture Dotfiles to Working Tree", fmt.Sprintf("Staging %d assets", len(allCapturedPaths)))
+		quotedPaths := make([]string, 0, len(allCapturedPaths))
 		for _, p := range allCapturedPaths {
-			b.AddCommand(fmt.Sprintf("git add -- %q", p), "Stage captured asset exclusively")
+			quoted := fmt.Sprintf("%q", p)
+			quotedPaths = append(quotedPaths, quoted)
+			b.AddCommand("git --literal-pathspecs add -- "+quoted, "Stage captured asset exclusively")
 		}
 		b.AddSection("Branch Creation", fmt.Sprintf("Create capture branch %s", bName))
 		b.AddCommand(fmt.Sprintf("git checkout -b %q", bName), "Isolate changes in dedicated branch")
 		b.AddSection("Commit Captured Changes", "Create atomic conventional commit")
-		b.AddCommand(fmt.Sprintf("git commit -m %q", cMsg), "Ownership-guarded commit")
-		if doPush {
+		b.AddCommand(
+			fmt.Sprintf("git --literal-pathspecs commit -m %q --only -- %s", cMsg, strings.Join(quotedPaths, " ")),
+			"Commit only captured assets",
+		)
+		if doPush && !appCtx.Flags.Offline {
 			b.AddSection("Remote Push", fmt.Sprintf("Push %s to origin", bName))
 			b.AddCommand(fmt.Sprintf("git push -u origin %q", bName), "Publish branch")
 		}
@@ -217,7 +224,7 @@ func runCaptureWizard(cmd *cobra.Command, appCtx *AppContext, group string) erro
 	fmt.Fprintf(out, "\nCapturing %d configuration(s) into %s/files/...\n", len(toCapture), appCtx.RepoRoot)
 	var wizardCapturedPaths []string
 	for _, id := range toCapture {
-		opts := app.SyncOptions{Group: id, Push: true}
+		opts := app.SyncOptions{Group: id, Push: true, DryRun: appCtx.Flags.DryRun}
 		res, err := appCtx.SyncSvc.Sync(ctx, opts)
 		if err != nil {
 			fmt.Fprintf(out, "  %s Failed capturing %s: %v\n", st.Error.Render("✗"), id, err)
@@ -246,25 +253,14 @@ func runCaptureWizard(cmd *cobra.Command, appCtx *AppContext, group string) erro
 		branch = defaultBranch
 	}
 
-	// Authorization Check for Push
-	auth := checkGitPushAuthorization(ctx, appCtx)
-	fmt.Fprintf(out, "\nGit Push Authorization Status: ")
-	if auth.IsAuthorized {
-		fmt.Fprintf(out, "%s (user: %s, repo owner: %s)\n", st.Success.Render("Authorized"), auth.ActiveUser, auth.RepoOwner)
-	} else {
-		fmt.Fprintf(out, "%s (%s)\n", st.Warning.Render("Restricted"), auth.Reason)
-	}
-
 	doPush := false
-	if auth.IsAuthorized {
-		fmt.Printf("Push branch '%s' to remote origin? [y/N]: ", branch)
+	if !appCtx.Flags.Offline && !appCtx.Flags.DryRun {
+		fmt.Fprintf(out, "Push branch '%s' to remote origin if authorized? [y/N]: ", branch)
 		pAns, _ := reader.ReadString('\n')
 		pAns = strings.TrimSpace(strings.ToLower(pAns))
 		if pAns == "y" || pAns == "yes" {
 			doPush = true
 		}
-	} else {
-		fmt.Fprintln(out, st.Muted.Render("Remote push is disabled because you are not listed as the repository owner/member."))
 	}
 
 	return executeGitCommitAndPush(cmd, appCtx, branch, "", wizardCapturedPaths, doPush)
@@ -294,7 +290,7 @@ func executeGitCommitAndPush(
 		for _, p := range capturedPaths {
 			fmt.Fprintf(out, "  [dry-run] git add -- %s\n", p)
 		}
-		if doPush {
+		if doPush && !appCtx.Flags.Offline {
 			fmt.Fprintf(out, "  [dry-run] Would push branch %s to origin\n", branchName)
 		}
 		return nil
@@ -302,6 +298,10 @@ func executeGitCommitAndPush(
 
 	if len(capturedPaths) == 0 {
 		return nil
+	}
+	adapter := newGitAdapter()
+	if err := adapter.ValidateBranch(ctx, repo, branchName); err != nil {
+		return err
 	}
 
 	// Secret scan every captured file before staging
@@ -318,19 +318,22 @@ func executeGitCommitAndPush(
 	}
 
 	// 1. Create and switch to feature branch
-	if bErr := exec.CommandContext(ctx, "git", "-C", repo, "checkout", "-b", branchName).Run(); bErr != nil {
+	if bErr := exec.CommandContext(ctx, "git", "-C", repo, "switch", "-c", branchName).Run(); bErr != nil {
 		// If branch exists, just checkout
-		_ = exec.CommandContext(ctx, "git", "-C", repo, "checkout", branchName).Run()
+		if err := exec.CommandContext(ctx, "git", "-C", repo, "switch", "--no-guess", branchName).Run(); err != nil {
+			return fmt.Errorf("switching to capture branch %q: %w", branchName, err)
+		}
 	}
 
 	// 2. Stage ONLY the exact allowlisted captured files
-	addArgs := append([]string{"-C", repo, "add", "--"}, capturedPaths...)
+	addArgs := append([]string{"-C", repo, "--literal-pathspecs", "add", "--"}, capturedPaths...)
 	if aErr := exec.CommandContext(ctx, "git", addArgs...).Run(); aErr != nil {
 		return fmt.Errorf("staging captured files: %w", aErr)
 	}
 
 	// 3. Commit
-	cCmd := exec.CommandContext(ctx, "git", "-C", repo, "commit", "-m", commitMsg)
+	commitArgs := append([]string{"-C", repo, "--literal-pathspecs", "commit", "-m", commitMsg, "--only", "--"}, capturedPaths...)
+	cCmd := exec.CommandContext(ctx, "git", commitArgs...)
 	cOut, cErr := cCmd.CombinedOutput()
 	if cErr != nil && !strings.Contains(string(cOut), "nothing to commit") {
 		return fmt.Errorf("git commit failed: %s (%w)", string(cOut), cErr)
@@ -340,7 +343,15 @@ func executeGitCommitAndPush(
 
 	// 4. Push if requested
 	if doPush {
-		auth := checkGitPushAuthorization(ctx, appCtx)
+		if appCtx.Flags.Offline {
+			fmt.Fprintln(out, "Offline mode: the capture commit was not pushed.")
+			return nil
+		}
+		target, err := adapter.OriginPushURL(ctx, repo)
+		if err != nil {
+			return err
+		}
+		auth := authorizeGitPush(ctx, appCtx, target)
 		if !auth.IsAuthorized {
 			fmt.Fprintf(out, "%s %s\n", st.Warning.Render("[Push Guard]"), auth.Reason)
 			fmt.Fprintf(out, "  Commit remains safely stored in local branch '%s'. Push was omitted.\n", branchName)
@@ -348,10 +359,10 @@ func executeGitCommitAndPush(
 		}
 
 		fmt.Fprintf(out, "Pushing branch %s to origin...\n", branchName)
-		pCmd := exec.CommandContext(ctx, "git", "-C", repo, "push", "-u", "origin", branchName)
-		pOut, pErr := pCmd.CombinedOutput()
-		if pErr != nil {
-			return fmt.Errorf("git push failed: %s (%w)", string(pOut), pErr)
+		if err := adapter.PushBranch(ctx, gittransport.PushOptions{
+			Dir: repo, URL: target, Branch: branchName, SSHKey: resolveConfigSSHKey(appCtx, ""),
+		}); err != nil {
+			return fmt.Errorf("git push failed: %w", err)
 		}
 		fmt.Fprintf(out, "%s Successfully pushed branch %s to origin\n", st.Success.Render("✓"), branchName)
 	}
@@ -359,17 +370,13 @@ func executeGitCommitAndPush(
 	return nil
 }
 
-func checkGitPushAuthorization(ctx context.Context, appCtx *AppContext) AuthCheckResult {
+func authorizeGitPush(ctx context.Context, appCtx *AppContext, originURL string) AuthCheckResult {
 	repo := appCtx.RepoRoot
 	v := appCtx.Viper
 
-	// 1. Determine origin owner
-	cmd := exec.CommandContext(ctx, "git", "-C", repo, "remote", "get-url", "origin")
-	out, err := cmd.Output()
-	originURL := strings.TrimSpace(string(out))
-
+	// Identify the configured owner of the push destination, not the fetch URL.
 	owner := v.GetString("repo_owner")
-	if owner == "" && err == nil && originURL != "" {
+	if owner == "" && originURL != "" {
 		owner = parseGitRepoOwner(originURL)
 	}
 
@@ -426,30 +433,9 @@ func checkGitPushAuthorization(ctx context.Context, appCtx *AppContext) AuthChec
 }
 
 func parseGitRepoOwner(remoteURL string) string {
-	remoteURL = strings.TrimSpace(remoteURL)
-	remoteURL = strings.TrimSuffix(remoteURL, ".git")
-
-	// HTTP/HTTPS format: https://github.com/owner/repo
-	if strings.HasPrefix(remoteURL, "http://") || strings.HasPrefix(remoteURL, "https://") {
-		trimmed := strings.TrimPrefix(remoteURL, "https://")
-		trimmed = strings.TrimPrefix(trimmed, "http://")
-		parts := strings.Split(strings.Trim(trimmed, "/"), "/")
-		if len(parts) >= 2 {
-			return parts[1]
-		}
-		return ""
+	repo := gittransport.NormalizeURL(remoteURL)
+	if owner, path, ok := strings.Cut(repo.OwnerRepo, "/"); ok && path != "" {
+		return owner
 	}
-
-	// SSH format: git@github.com:owner/repo
-	if strings.Contains(remoteURL, ":") {
-		parts := strings.Split(remoteURL, ":")
-		if len(parts) == 2 {
-			pathParts := strings.Split(strings.Trim(parts[1], "/"), "/")
-			if len(pathParts) >= 2 {
-				return pathParts[0]
-			}
-		}
-	}
-
 	return ""
 }
