@@ -10,20 +10,25 @@
 
 ## Installation
 
-Start from a trusted checkout. Review the ref and install script before running
-it; do not pipe a mutable remote script directly into a shell. Configuration
-repositories can run scripts too: use only repositories you trust.
+### Linux / macOS
+
+Quick install:
+
+```sh
+curl -fsSL https://sh.arturonavax.dev | sh
+```
+
+This runs the installer served by the Cloudflare Worker. If you want to review
+the code before running it, use a trusted checkout instead:
 
 ```sh
 git clone https://github.com/arturonavax/anx.git
 cd anx
-```
-
-### Linux / macOS
-
-```sh
+# Review install.sh and the checked-out revision before continuing.
 sh ./install.sh --install-only
 ```
+
+Configuration repositories can run scripts too; use only repositories you trust.
 
 The bootstrap does not install GVM or Homebrew automatically. When Go is
 missing, it can use an existing GVM or native package manager. To avoid
