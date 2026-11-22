@@ -101,6 +101,55 @@ func TestResolveRepoRootPrefersManagedEnvironmentAndKeepsLegacy(t *testing.T) {
 	}
 }
 
+func TestSourceInstallerDoesNotReuseLegacyEnvironmentPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell bootstrap test")
+	}
+	script, err := filepath.Abs(filepath.Join("..", "..", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	legacy := filepath.Join(home, ".local", "share", "anx", "repo")
+	source := t.TempDir()
+	bin := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(legacy, "manifests"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(source, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	engineMarker := "scripts/bootstrap_anx.sh"
+	if err := os.WriteFile(filepath.Join(source, engineMarker), []byte("#!/bin/sh\necho engine-bootstrap\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "uname"), []byte("#!/bin/sh\necho Darwin\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", script, "--from-source", "--plan")
+	cmd.Dir = home
+	cmd.Env = []string{"HOME=" + home, "PATH=" + bin + ":/usr/bin:/bin", "ANX_GIT_URL=" + source}
+	if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "engine-bootstrap") {
+		t.Fatalf("installer failed: %v\n%s", err, out)
+	}
+	engine := filepath.Join(home, ".local", "share", "anx", "engine")
+	if _, err := os.Stat(filepath.Join(engine, engineMarker)); err != nil {
+		t.Errorf("engine source checkout not found: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(legacy, engineMarker)); !os.IsNotExist(err) {
+		t.Errorf("installer reused the legacy environment checkout: %v", err)
+	}
+	overridden := exec.Command("sh", script, "--from-source", "--plan")
+	overridden.Dir = home
+	overridden.Env = append(cmd.Env, "ANX_REPO_DIR="+legacy)
+	if out, err := overridden.CombinedOutput(); err == nil || !strings.Contains(string(out), "is an environment checkout") {
+		t.Errorf("invalid engine override: err=%v output=%q", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(legacy, engineMarker)); !os.IsNotExist(err) {
+		t.Errorf("explicit engine override mutated the legacy environment checkout: %v", err)
+	}
+}
+
 func TestMacOSFreshBookBootstrapWithoutCLT(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell bootstrap test skipped on Windows")

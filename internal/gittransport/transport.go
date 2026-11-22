@@ -608,6 +608,25 @@ type UpdateOptions struct {
 	SSHKey string
 }
 
+// LocalOrigin reads the configured origin without applying Git's URL rewrites.
+func (a *Adapter) LocalOrigin(ctx context.Context, dir string) (string, error) {
+	return a.readLocalValue(ctx, dir, "config", "--local", "--get", "remote.origin.url")
+}
+
+// LocalRevision resolves a local ref to the full ID of a commit without fetching.
+func (a *Adapter) LocalRevision(ctx context.Context, dir, ref string) (string, error) {
+	return a.readLocalValue(ctx, dir, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
+}
+
+func (a *Adapter) readLocalValue(ctx context.Context, dir string, args ...string) (string, error) {
+	runner := a.Runner
+	if runner == nil {
+		runner = execRunner{}
+	}
+	out, _, err := runner.Run(ctx, NonInteractiveEnv(), dir, "git", args...)
+	return strings.TrimSpace(out), err
+}
+
 // Update fetches and fast-forwards an existing Git checkout safely in non-interactive mode.
 func (a *Adapter) Update(ctx context.Context, dir, ref string) error {
 	return a.UpdateWithOptions(ctx, UpdateOptions{

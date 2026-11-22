@@ -288,7 +288,13 @@ if ($userPath -notlike "*$DestDir*") {
 }
 
 if ($ForwardArgs.Count -gt 0) {
-    & (Join-Path $DestDir "anx.exe") @ForwardArgs
+    $previousInstallEnv = $env:ANX_INSTALL_ENV
+    try {
+        $env:ANX_INSTALL_ENV = "1"
+        & (Join-Path $DestDir "anx.exe") @ForwardArgs
+    } finally {
+        $env:ANX_INSTALL_ENV = $previousInstallEnv
+    }
 } else {
     $aliasHint = ""
     if ($BinName -and $BinName -ne "anx") {

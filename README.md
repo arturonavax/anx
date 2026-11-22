@@ -32,9 +32,21 @@ Configuration repositories can run scripts too; use only repositories you trust.
 
 To clone and link an environment, run `anx repo clone <url>`. The default
 checkout is `~/.local/share/anx/env`, regardless of the remote repository name.
-This is separate from the ANX source checkout used by the installer. Existing
-linked environments stay where they are. To switch remotes without replacing a
-checkout, use `anx repo clone <url> --dir <new-path>`.
+The installer keeps ANX source separate at `~/.local/share/anx/engine` on
+Linux/macOS or `%LOCALAPPDATA%\anx\engine` on Windows. Existing linked
+environments stay where they are. To switch remotes without replacing a checkout,
+use `anx repo clone <url> --dir <new-path>`.
+
+When the installer launches the setup wizard or an unattended apply, ANX
+enrolls the environment before it loads the plan. Use the installer's
+`--config-repo` and `--config-ref` options (or `ANX_CONFIG_REPO` and
+`ANX_CONFIG_REF`) to select a source. ANX does not replace a different linked
+checkout or fetch one for an offline run or a dry run. Use `--install-only`
+on Linux/macOS to install just the ANX binary.
+
+```sh
+sh ./install.sh wizard --yes --config-repo git@github.com:YOUR-ORG/YOUR-ENV.git
+```
 
 The bootstrap does not install GVM or Homebrew automatically. When Go is
 missing, it can use an existing GVM or native package manager. To avoid

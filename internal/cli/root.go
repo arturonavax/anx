@@ -98,8 +98,15 @@ func NewRootCommand(appCtx *AppContext) *cobra.Command {
 		SilenceErrors: true,
 		Args:          cobra.NoArgs,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			selection := installerEnvironmentSelection{
+				repo: appCtx.Flags.ConfigRepo,
+				ref:  appCtx.Flags.ConfigRef,
+			}
 			_, _ = security.EnsureSudoPAMHealthy()
-			return applyConfigLayering(cmd, appCtx)
+			if err := applyConfigLayering(cmd, appCtx); err != nil {
+				return err
+			}
+			return enrollInstallerEnvironment(cmd, appCtx, selection)
 		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if appCtx.Flags.Yes {

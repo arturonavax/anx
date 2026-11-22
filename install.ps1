@@ -40,7 +40,11 @@ while ($cur -and (Test-Path $cur)) {
 
 # 2. Remote Bootstrap: clone repository if not already present
 if (-not $RepoRoot) {
-    $TargetRepo = if ($env:ANX_REPO_DIR) { $env:ANX_REPO_DIR } else { Join-Path $env:LOCALAPPDATA "anx\repo" }
+    $TargetRepo = if ($env:ANX_REPO_DIR) { $env:ANX_REPO_DIR } else { Join-Path $env:LOCALAPPDATA "anx\engine" }
+    if (-not (Test-Path (Join-Path $TargetRepo "scripts\bootstrap_anx.ps1")) -and
+        ((Test-Path (Join-Path $TargetRepo "manifests")) -or (Test-Path (Join-Path $TargetRepo "files")))) {
+        throw "$TargetRepo is an environment checkout. Set ANX_REPO_DIR to an unused engine checkout path."
+    }
     Write-Info "Remote execution detected: bootstrapping repository into $TargetRepo..."
 
     if (-not (Test-Path (Split-Path -Parent $TargetRepo))) {

@@ -593,6 +593,7 @@ execute_anx_target() {
 		return 0
 	fi
 
+	export ANX_INSTALL_ENV=1
 	log_info "Delegating execution to: ${DEST_BIN}/anx $*"
 	if [[ "${ANX_ONE_SHOT:-0}" -eq 1 && "${ANX_NO_SHELL_RELOAD:-0}" -eq 0 && -c /dev/tty ]] && ( : </dev/tty ) 2>/dev/null; then
 		local rc_before rc_after cmd_rc=0

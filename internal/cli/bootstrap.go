@@ -39,7 +39,14 @@ func BuildLazyAppContext(version, commit, date string) (*AppContext, error) {
 
 // BuildAppContext constructs the runtime AppContext by delegating to the reusable bootstrap container.
 func BuildAppContext(version, commit, date string) (*AppContext, error) {
-	container, err := bootstrap.NewContainer(bootstrap.WithVersion(version, commit, date))
+	return buildAppContext(version, commit, date, "")
+}
+
+func buildAppContext(version, commit, date, repo string) (*AppContext, error) {
+	container, err := bootstrap.NewContainer(
+		bootstrap.WithVersion(version, commit, date),
+		bootstrap.WithRepoRoot(repo),
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -327,6 +327,7 @@ if [ "$INTERACTIVE_TTY" -eq 1 ]; then
 fi
 
 export ANX_ONE_SHOT
+export ANX_INSTALL_ENV=1
 if [ "$FORCE_SOURCE" -eq 1 ]; then
 	export ANX_FORCE_SOURCE=1
 fi
@@ -501,7 +502,12 @@ try_go_install_direct() {
 }
 
 ensure_repo_checkout() {
-	TARGET_REPO="${ANX_REPO_DIR:-${HOME}/.local/share/anx/repo}"
+	TARGET_REPO="${ANX_REPO_DIR:-${HOME}/.local/share/anx/engine}"
+	if [ ! -f "${TARGET_REPO}/scripts/bootstrap_anx.sh" ] &&
+		{ [ -d "${TARGET_REPO}/manifests" ] || [ -d "${TARGET_REPO}/files" ]; }; then
+		echo "[Installer Error]: ${TARGET_REPO} is an environment checkout. Set ANX_REPO_DIR to an unused engine checkout path." >&2
+		exit 1
+	fi
 	echo "  [INFO] Bootstrapping repository into ${TARGET_REPO}..."
 	mkdir -p "$(dirname "${TARGET_REPO}")"
 	TARBALL_URL="${ANX_TARBALL_URL:-https://github.com/arturonavax/anx/archive/refs/heads/main.tar.gz}"

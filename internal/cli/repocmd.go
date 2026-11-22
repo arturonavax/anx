@@ -91,7 +91,6 @@ func resolveConfigRepoURL(appCtx *AppContext, explicit string) string {
 		appCtx.Flags.ConfigRepo,
 		os.Getenv("ANX_CONFIG_REPO"),
 		os.Getenv("ANX_DOTFILES_URL"),
-		os.Getenv("ANX_GIT_URL"),
 	} {
 		if strings.TrimSpace(cand) != "" {
 			return strings.TrimSpace(cand)
